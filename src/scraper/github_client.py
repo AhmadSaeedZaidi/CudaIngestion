@@ -80,19 +80,14 @@ class GitHubClient:
         query: str,
         per_page: int = 30,
         page: int = 1,
-        sort: str = "stars",
-        order: str = "desc",
     ) -> dict[str, Any]:
         """
         Search for code using GitHub's search API.
-        Results are sorted by stars by default to ensure high-quality kernels.
 
         Args:
-            query: Search query string
+            query: Search query string (can include stars:>50 fork:false etc.)
             per_page: Results per page (max 100)
             page: Page number
-            sort: Sort field (indexed, stars, forks, etc.) - default: stars
-            order: Sort order (asc or desc) - default: desc
 
         Returns:
             Search results with items and metadata
@@ -102,11 +97,9 @@ class GitHubClient:
             "q": query,
             "per_page": min(per_page, 100),
             "page": page,
-            "sort": sort,
-            "order": order,
         }
 
-        logger.info(f"Searching GitHub: {query} (page {page}, sort={sort}, order={order})")
+        logger.info(f"Searching GitHub: {query} (page {page})")
         return self._request("GET", url, params=params)
 
     def get_file_content(self, repo: str, path: str, ref: str | None = None) -> dict[str, Any]:
@@ -156,10 +149,13 @@ class GitHubClient:
         """
         Search for CUDA files with automatic pagination.
         Returns results and the final page reached for checkpointing.
-        Results are sorted by stars descending by default.
+
+        Note: Quality constraints (stars:>50, fork:false) should be included
+        in the query string. The /search/code endpoint does not support
+        separate sort/order parameters.
 
         Args:
-            query: Additional search query terms
+            query: Additional search query terms (should include stars:>50 fork:false)
             max_results: Maximum number of results to fetch
             start_page: Page to start from (for resume support)
 
@@ -176,8 +172,6 @@ class GitHubClient:
                 query=f"{query} language:CUDA",
                 per_page=min(per_page, remaining),
                 page=page,
-                sort="stars",
-                order="desc",
             )
 
             items = results.get("items", [])
@@ -205,10 +199,13 @@ class GitHubClient:
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """
         Search for CUDA files with checkpoint support for resume after crash/timeout.
-        Results are sorted by stars descending for quality.
+
+        Note: Quality constraints (stars:>50, fork:false) should be included
+        in the query string. The /search/code endpoint does not support
+        separate sort/order parameters.
 
         Args:
-            query: Additional search query terms
+            query: Additional search query terms (should include stars:>50 fork:false)
             max_results: Maximum number of results to fetch
             checkpoint_data: Previous checkpoint state (query, page, processed_count)
 
@@ -237,8 +234,6 @@ class GitHubClient:
                 query=f"{query} language:CUDA",
                 per_page=min(per_page, remaining),
                 page=page,
-                sort="stars",
-                order="desc",
             )
 
             items = results.get("items", [])
