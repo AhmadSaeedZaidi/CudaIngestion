@@ -8,7 +8,10 @@ class QueryBuilder:
     """
     Builds GitHub search queries for CUDA files across diverse computational domains.
     Prevents mode collapse by cycling through different computational fields.
-    Enforces strict quality constraints: stars:>50, fork:false, sorted by stars desc.
+
+    Note: For code search (/search/code), only language:, repo:, path:, filename:,
+    and extension: qualifiers are supported. Repository qualifiers like stars:>50
+    and fork:false must be handled via the two-step repo-then-code approach.
     """
 
     # Domain-specific search terms to ensure diverse kernel coverage
@@ -34,10 +37,6 @@ class QueryBuilder:
     # File extensions for CUDA
     EXTENSIONS = ["cu", "cuh"]
 
-    # Quality constraints: minimum stars and no forks
-    MIN_STARS = 50
-    FORK_FILTER = "fork:false"
-
     def __init__(self, seed: int = 42):
         """
         Initialize query builder.
@@ -59,20 +58,19 @@ class QueryBuilder:
 
     def get_next_query(self) -> str:
         """
-        Get the next search query with domain diversity and quality constraints.
+        Get the next search query with domain diversity.
+        Note: Only includes qualifiers valid for /search/code endpoint.
 
         Returns:
-            GitHub search query string with stars:>50 and fork:false
+            GitHub search query string for code search
         """
         domain_terms = next(self._domain_cycle)
         primary_term = domain_terms[0]
 
-        # Build query with strict quality constraints
+        # Build query with CUDA extension filter (valid for code search)
         query_parts = [
             f"{primary_term}",
             "extension:cu OR extension:cuh",
-            f"stars:>{self.MIN_STARS}",
-            self.FORK_FILTER,
         ]
 
         return " ".join(query_parts)
@@ -80,28 +78,21 @@ class QueryBuilder:
     def build_query(
         self,
         domain: str,
-        min_stars: int = MIN_STARS,
-        include_fork_filter: bool = True,
     ) -> str:
         """
-        Build a custom query for a specific domain with quality constraints.
+        Build a custom query for a specific domain.
+        Note: Only includes qualifiers valid for /search/code endpoint.
 
         Args:
             domain: Domain term to search for
-            min_stars: Minimum star count (default: 50)
-            include_fork_filter: Whether to filter out forks (default: True)
 
         Returns:
-            GitHub search query string
+            GitHub search query string for code search
         """
         query_parts = [
             domain,
             "extension:cu OR extension:cuh",
-            f"stars:>{min_stars}",
         ]
-
-        if include_fork_filter:
-            query_parts.append(self.FORK_FILTER)
 
         return " ".join(query_parts)
 
@@ -110,7 +101,7 @@ class QueryBuilder:
         Get all available domain queries for batch processing.
 
         Returns:
-            List of query strings with quality constraints
+            List of query strings
         """
         queries = []
         for domain_terms in self.DOMAIN_TERMS:
@@ -126,6 +117,28 @@ class QueryBuilder:
             num_queries: Number of queries to return
 
         Returns:
-            List of diverse query strings with quality constraints
+            List of diverse query strings
         """
         return [next(self._domain_cycle)[0] for _ in range(num_queries)]
+
+    @staticmethod
+    def get_repo_filter_query(min_stars: int = 50, fork_filter: bool = False) -> str:
+        """
+        Get the repository search query for quality filtering.
+        This is used with /search/repositories to find top CUDA repos.
+
+        Args:
+            min_stars: Minimum star count (default: 50)
+            fork_filter: Whether to filter out forks (default: False)
+
+        Returns:
+            Repository search query string
+        """
+        query_parts = [
+            "language:CUDA",
+            f"stars:>{min_stars}",
+        ]
+        if fork_filter:
+            query_parts.append("fork:false")
+
+        return " ".join(query_parts)

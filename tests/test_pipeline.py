@@ -99,6 +99,19 @@ class TestQueryBuilder:
         assert len(queries) == 5
         assert len(set(queries)) == 5  # All unique
 
+    def test_repo_filter_query(self):
+        """Test that repo filter query is correctly generated."""
+        from src.scraper.query_builder import QueryBuilder
+
+        # Test default
+        repo_query = QueryBuilder.get_repo_filter_query()
+        assert "language:CUDA" in repo_query
+        assert "stars:>50" in repo_query
+
+        # Test with fork filter
+        repo_query_with_fork = QueryBuilder.get_repo_filter_query(fork_filter=True)
+        assert "fork:false" in repo_query_with_fork
+
 
 class TestPipelineDryRun:
     """Test pipeline in dry-run mode with mocked external services."""
@@ -191,9 +204,9 @@ class TestPipelineIntegration:
             dry_run=True,
         )
 
-        # Mock GitHub response
+        # Mock GitHub response for code search
         encoded_content = base64.b64encode(SAMPLE_CUDA_KERNEL.encode()).decode()
-        mock_search_result = {
+        mock_code_search_result = {
             "items": [
                 {
                     "repository": {"full_name": "test/repo"},
@@ -204,30 +217,42 @@ class TestPipelineIntegration:
         }
         mock_file_content = {"content": encoded_content}
 
+        # Mock repo search result
+        mock_repo_search_result = {
+            "items": [
+                {"full_name": "test/repo", "stargazers_count": 100},
+                {"full_name": "another/repo", "stargazers_count": 50},
+            ]
+        }
+
         with patch("src.core.config.get_config", return_value=mock_config):
             with patch(
-                "src.scraper.github_client.GitHubClient.search_code",
-                return_value=mock_search_result,
+                "src.scraper.github_client.GitHubClient.search_repositories",
+                return_value=mock_repo_search_result,
             ):
                 with patch(
-                    "src.scraper.github_client.GitHubClient.get_file_content",
-                    return_value=mock_file_content,
+                    "src.scraper.github_client.GitHubClient.search_code",
+                    return_value=mock_code_search_result,
                 ):
                     with patch(
-                        "src.scraper.github_client.GitHubClient.get_commits",
-                        return_value=[{"sha": "abc123"}],
+                        "src.scraper.github_client.GitHubClient.get_file_content",
+                        return_value=mock_file_content,
                     ):
-                        from src.main import IngestionPipeline
+                        with patch(
+                            "src.scraper.github_client.GitHubClient.get_commits",
+                            return_value=[{"sha": "abc123"}],
+                        ):
+                            from src.main import IngestionPipeline
 
-                        pipeline = IngestionPipeline(dry_run=True)
+                            pipeline = IngestionPipeline(dry_run=True)
 
-                        # This should NOT raise any exceptions
-                        results = pipeline.run_batch(max_kernels=1)
+                            # This should NOT raise any exceptions
+                            results = pipeline.run_batch(max_kernels=1)
 
-                        # In dry-run, no MiniMax annotation happens, but records pass filters
-                        # Note: "annotated" counts records that passed filters, not actual API calls
-                        assert results["annotated"] == 1
-                        assert results["filtered"] == 0
+                            # In dry-run, no MiniMax annotation happens, but records pass filters
+                            # Note: "annotated" counts records that passed filters, not actual API calls
+                            assert results["annotated"] == 1
+                            assert results["filtered"] == 0
 
 
 if __name__ == "__main__":
