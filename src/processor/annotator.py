@@ -44,7 +44,7 @@ Return ONLY the JSON object, no additional text."""
 
     USER_PROMPT_TEMPLATE = """Analyze this CUDA kernel:
 
-```{cuda_code}
+```cuda
 {code}
 ```"""
 
