@@ -2,7 +2,7 @@
 
 import os
 from dataclasses import dataclass
-from typing import Optional
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -13,20 +13,20 @@ class Config:
     """Application configuration loaded from environment variables."""
 
     # Neon PostgreSQL
-    neon_uri: Optional[str] = os.getenv("NEON_URI")
+    neon_uri: str | None = os.getenv("NEON_URI")
 
     # GitHub - use TOKEN_GITHUB (GitHub Actions restricts GITHUB_* prefix)
-    github_token: Optional[str] = os.getenv("TOKEN_GITHUB")
+    github_token: str | None = os.getenv("TOKEN_GITHUB")
 
     # MiniMax M2.7 API
-    minimax_api_key: Optional[str] = os.getenv("MINIMAX_API_KEY")
+    minimax_api_key: str | None = os.getenv("MINIMAX_API_KEY")
     minimax_api_base: str = os.getenv("MINIMAX_API_BASE", "https://api.minimaxi.chat/v1")
 
     # Pipeline settings
     batch_size: int = int(os.getenv("BATCH_SIZE", "10"))
     max_kernel_length: int = int(os.getenv("MAX_KERNEL_LENGTH", "50000"))
     min_kernel_length: int = int(os.getenv("MIN_KERNEL_LENGTH", "50"))
-    
+
     # Dry run mode
     dry_run: bool = os.getenv("DRY_RUN", "false").lower() in ("true", "1", "yes")
 

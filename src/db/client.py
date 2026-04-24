@@ -1,13 +1,14 @@
 """Neon PostgreSQL client with connection pooling, batching, and deduplication."""
 
 import hashlib
+from collections.abc import Generator
 from contextlib import contextmanager
-from typing import Any, Dict, Generator, List, Optional
 from dataclasses import dataclass
+from typing import Any
 
 from sqlalchemy import create_engine, text
-from sqlalchemy.pool import NullPool
 from sqlalchemy.engine import Engine
+from sqlalchemy.pool import NullPool
 
 try:
     import psycopg2.extras
@@ -27,10 +28,10 @@ class KernelRecord:
     file_path: str
     commit_hash: str
     raw_code: str
-    domain_tag: Optional[str] = None
-    algorithmic_intent: Optional[str] = None
-    memory_pattern: Optional[str] = None
-    hardware_utilization: Optional[str] = None
+    domain_tag: str | None = None
+    algorithmic_intent: str | None = None
+    memory_pattern: str | None = None
+    hardware_utilization: str | None = None
 
 
 class DatabaseClient:
@@ -81,7 +82,7 @@ class DatabaseClient:
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_code_hash ON kernels(code_hash)"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_domain_tag ON kernels(domain_tag)"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ingested_at ON kernels(ingested_at)"))
-            
+
             # Create ingestion state table for checkpointing
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS ingestion_state (
@@ -92,7 +93,7 @@ class DatabaseClient:
                 )
             """))
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_state_key ON ingestion_state(state_key)"))
-            
+
             conn.commit()
         logger.info("Database schema initialized")
 
@@ -125,7 +126,7 @@ class DatabaseClient:
             )
             return result.fetchone() is not None
 
-    def get_existing_hashes(self, code_hashes: List[str]) -> set[str]:
+    def get_existing_hashes(self, code_hashes: list[str]) -> set[str]:
         """
         Check multiple hashes at once for efficiency.
 
@@ -167,10 +168,10 @@ class DatabaseClient:
         with self.engine.connect() as conn:
             conn.execute(
                 text("""
-                    INSERT INTO kernels 
-                    (repo_name, file_path, commit_hash, raw_code, code_hash, 
+                    INSERT INTO kernels
+                    (repo_name, file_path, commit_hash, raw_code, code_hash,
                      domain_tag, algorithmic_intent, memory_pattern, hardware_utilization)
-                    VALUES 
+                    VALUES
                     (:repo_name, :file_path, :commit_hash, :raw_code, :code_hash,
                      :domain_tag, :algorithmic_intent, :memory_pattern, :hardware_utilization)
                 """),
@@ -190,14 +191,14 @@ class DatabaseClient:
             logger.info(f"Inserted kernel: {record.repo_name}/{record.file_path}")
             return True
 
-    def _bulk_insert_psycopg2(self, records: List[KernelRecord], code_hashes: List[str]) -> int:
+    def _bulk_insert_psycopg2(self, records: list[KernelRecord], code_hashes: list[str]) -> int:
         """
         Use psycopg2.extras.execute_values for high-throughput batch inserts.
         This is the preferred method for Neon PostgreSQL.
         """
         if not HAS_PSYCOPG2:
             raise ImportError("psycopg2 is required for bulk inserts")
-        
+
         # Get raw connection for execute_values
         raw_conn = self.engine.raw_connection()
         try:
@@ -209,11 +210,11 @@ class DatabaseClient:
                 )
                 for i, r in enumerate(records)
             ]
-            
+
             psycopg2.extras.execute_values(
                 raw_conn,
                 """
-                INSERT INTO kernels 
+                INSERT INTO kernels
                 (repo_name, file_path, commit_hash, raw_code, code_hash,
                  domain_tag, algorithmic_intent, memory_pattern, hardware_utilization)
                 VALUES %s
@@ -227,13 +228,12 @@ class DatabaseClient:
         finally:
             raw_conn.close()
 
-    def _bulk_insert_sqlalchemy(self, records: List[KernelRecord], code_hashes: List[str]) -> int:
+    def _bulk_insert_sqlalchemy(self, records: list[KernelRecord], code_hashes: list[str]) -> int:
         """
         Fallback: Use SQLAlchemy Core for batch inserts.
         Less efficient than psycopg2.extras but works without psycopg2.
         """
-        from sqlalchemy import insert
-        
+
         values = [
             {
                 "repo_name": r.repo_name,
@@ -248,7 +248,7 @@ class DatabaseClient:
             }
             for i, r in enumerate(records)
         ]
-        
+
         with self.engine.connect() as conn:
             # Use execute_values via text for ON CONFLICT support
             for i in range(0, len(values), self.BATCH_SIZE):
@@ -256,14 +256,14 @@ class DatabaseClient:
                 placeholders = ", ".join([
                     "(%(repo_name)s, %(file_path)s, %(commit_hash)s, %(raw_code)s, %(code_hash)s, %(domain_tag)s, %(algorithmic_intent)s, %(memory_pattern)s, %(hardware_utilization)s)"
                 ] * len(batch))
-                
+
                 params = {}
                 for j, v in enumerate(batch):
                     for k, val in v.items():
                         params[f"{k}_{j}"] = val
-                
+
                 query = text(f"""
-                    INSERT INTO kernels 
+                    INSERT INTO kernels
                     (repo_name, file_path, commit_hash, raw_code, code_hash,
                      domain_tag, algorithmic_intent, memory_pattern, hardware_utilization)
                     VALUES {placeholders}
@@ -271,10 +271,10 @@ class DatabaseClient:
                 """)
                 conn.execute(query, params)
             conn.commit()
-        
+
         return len(records)
 
-    def insert_batch(self, records: List[KernelRecord]) -> int:
+    def insert_batch(self, records: list[KernelRecord]) -> int:
         """
         Insert multiple kernel records efficiently using batch inserts.
 
@@ -323,15 +323,15 @@ class DatabaseClient:
             logger.error(f"Bulk insert failed, falling back to row-by-row: {e}")
             # Fallback to row-by-row
             inserted_count = 0
-            for code_hash, record in zip(new_hashes, new_records):
+            for code_hash, record in zip(new_hashes, new_records, strict=True):
                 try:
                     with self.engine.connect() as conn:
                         conn.execute(
                             text("""
-                                INSERT INTO kernels 
+                                INSERT INTO kernels
                                 (repo_name, file_path, commit_hash, raw_code, code_hash,
                                  domain_tag, algorithmic_intent, memory_pattern, hardware_utilization)
-                                VALUES 
+                                VALUES
                                 (:repo_name, :file_path, :commit_hash, :raw_code, :code_hash,
                                  :domain_tag, :algorithmic_intent, :memory_pattern, :hardware_utilization)
                             """),
@@ -353,7 +353,7 @@ class DatabaseClient:
                     logger.error(f"Failed to insert kernel {record.repo_name}/{record.file_path}: {e}")
             return inserted_count
 
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, Any]:
         """
         Get database statistics.
 
@@ -364,10 +364,10 @@ class DatabaseClient:
             total = conn.execute(text("SELECT COUNT(*) FROM kernels")).scalar()
 
             by_domain = conn.execute(text("""
-                SELECT domain_tag, COUNT(*) as count 
-                FROM kernels 
-                WHERE domain_tag IS NOT NULL 
-                GROUP BY domain_tag 
+                SELECT domain_tag, COUNT(*) as count
+                FROM kernels
+                WHERE domain_tag IS NOT NULL
+                GROUP BY domain_tag
                 ORDER BY count DESC
             """)).fetchall()
 
@@ -378,7 +378,7 @@ class DatabaseClient:
 
     # ============ State Management for Checkpointing ============
 
-    def get_state(self, key: str) -> Optional[str]:
+    def get_state(self, key: str) -> str | None:
         """
         Get ingestion state value by key.
 
@@ -409,7 +409,7 @@ class DatabaseClient:
                 text("""
                     INSERT INTO ingestion_state (state_key, state_value, updated_at)
                     VALUES (:key, :value, CURRENT_TIMESTAMP)
-                    ON CONFLICT (state_key) 
+                    ON CONFLICT (state_key)
                     DO UPDATE SET state_value = :value, updated_at = CURRENT_TIMESTAMP
                 """),
                 {"key": key, "value": value}

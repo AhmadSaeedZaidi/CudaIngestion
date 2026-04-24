@@ -1,17 +1,16 @@
 """MiniMax M2.7 API integration for CUDA kernel annotation."""
 
 import json
-import base64
-from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any
+
 import requests
+from pydantic import BaseModel, Field
 from tenacity import (
     retry,
+    retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
-    retry_if_exception_type,
 )
-from pydantic import BaseModel, Field
 
 from src.core.logger import get_logger
 
@@ -71,7 +70,7 @@ Return ONLY the JSON object, no additional text."""
         stop=stop_after_attempt(5),
         reraise=True,
     )
-    def _make_request(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def _make_request(self, payload: dict[str, Any]) -> dict[str, Any]:
         """
         Make API request with exponential backoff for rate limits.
 
@@ -103,7 +102,7 @@ Return ONLY the JSON object, no additional text."""
         response.raise_for_status()
         return response.json()
 
-    def _parse_annotation(self, content: str) -> Optional[AnnotationSchema]:
+    def _parse_annotation(self, content: str) -> AnnotationSchema | None:
         """
         Parse JSON annotation from model response.
 
@@ -131,7 +130,7 @@ Return ONLY the JSON object, no additional text."""
             logger.debug(f"Content: {content[:500]}")
             return None
 
-    def annotate(self, code: str) -> Optional[AnnotationSchema]:
+    def annotate(self, code: str) -> AnnotationSchema | None:
         """
         Annotate a CUDA kernel with domain and algorithmic information.
 
@@ -182,7 +181,7 @@ Return ONLY the JSON object, no additional text."""
             logger.error(f"Unexpected error during annotation: {e}")
             return None
 
-    def annotate_batch(self, codes: list[str]) -> list[Optional[AnnotationSchema]]:
+    def annotate_batch(self, codes: list[str]) -> list[AnnotationSchema | None]:
         """
         Annotate multiple kernels.
 

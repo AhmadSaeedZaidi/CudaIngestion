@@ -2,7 +2,6 @@
 
 import re
 from dataclasses import dataclass
-from typing import Optional, Tuple
 
 from src.core.logger import get_logger
 
@@ -13,7 +12,7 @@ logger = get_logger(__name__)
 class FilterResult:
     """Result of filtering a CUDA kernel."""
     passed: bool
-    reason: Optional[str] = None
+    reason: str | None = None
 
 
 class CUDAFilter:
@@ -157,8 +156,8 @@ class CUDAFilter:
             FilterResult indicating pass/fail
         """
         lines = code.split("\n")
-        code_lines = [l for l in lines if l.strip() and not l.strip().startswith("//")]
-        comment_lines = [l for l in lines if l.strip().startswith("//")]
+        code_lines = [ln for ln in lines if ln.strip() and not ln.strip().startswith("//")]
+        comment_lines = [ln for ln in lines if ln.strip().startswith("//")]
 
         if len(code_lines) == 0:
             return FilterResult(False, "No actual code lines found")
@@ -169,7 +168,7 @@ class CUDAFilter:
 
         return FilterResult(True)
 
-    def filter(self, code: str) -> Tuple[bool, str]:
+    def filter(self, code: str) -> tuple[bool, str]:
         """
         Run all filters on CUDA code.
 

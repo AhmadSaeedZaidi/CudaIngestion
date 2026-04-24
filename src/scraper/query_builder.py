@@ -1,7 +1,7 @@
 """Query builder for diverse CUDA kernel domain coverage."""
 
 import itertools
-from typing import List, Iterator
+from collections.abc import Iterator
 
 
 class QueryBuilder:
@@ -46,7 +46,7 @@ class QueryBuilder:
         self.seed = seed
         self._domain_cycle = self._create_domain_cycle()
 
-    def _create_domain_cycle(self) -> Iterator[List[str]]:
+    def _create_domain_cycle(self) -> Iterator[list[str]]:
         """
         Create an infinite cycle through domain terms.
 
@@ -100,7 +100,7 @@ class QueryBuilder:
 
         return " ".join(query_parts)
 
-    def get_all_queries(self) -> List[str]:
+    def get_all_queries(self) -> list[str]:
         """
         Get all available domain queries for batch processing.
 
@@ -113,7 +113,7 @@ class QueryBuilder:
                 queries.append(self.build_query(term))
         return queries
 
-    def get_diverse_batch(self, num_queries: int = 5) -> List[str]:
+    def get_diverse_batch(self, num_queries: int = 5) -> list[str]:
         """
         Get a batch of diverse queries for parallel processing.
 

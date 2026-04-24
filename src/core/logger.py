@@ -2,10 +2,9 @@
 
 import logging
 import sys
-from typing import Optional
 
 
-def setup_logger(name: str, level: Optional[int] = None) -> logging.Logger:
+def setup_logger(name: str, level: int | None = None) -> logging.Logger:
     """
     Set up a configured logger with consistent formatting.
 

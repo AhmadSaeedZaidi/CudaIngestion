@@ -2,17 +2,16 @@
 
 import base64
 import json
-import sys
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from src.core.config import get_config
-from src.core.logger import setup_logger, get_logger
+from src.core.logger import get_logger, setup_logger
+from src.db.client import DatabaseClient, KernelRecord
+from src.processor.annotator import MiniMaxAnnotator
+from src.processor.filter import CUDAFilter
 from src.scraper.github_client import GitHubClient
 from src.scraper.query_builder import QueryBuilder
-from src.processor.filter import CUDAFilter
-from src.processor.annotator import MiniMaxAnnotator, AnnotationSchema
-from src.db.client import DatabaseClient, KernelRecord
 
 # Setup logging
 setup_logger("cuda-ingest")
@@ -59,7 +58,7 @@ class IngestionPipeline:
         self.db_client.init_schema()
         logger.info("Database schema ready")
 
-    def decode_file_content(self, file_data: Dict[str, Any]) -> Optional[str]:
+    def decode_file_content(self, file_data: dict[str, Any]) -> str | None:
         """
         Decode base64-encoded file content from GitHub API.
 
@@ -83,7 +82,7 @@ class IngestionPipeline:
             logger.error(f"Failed to decode file content: {e}")
             return None
 
-    def fetch_kernel(self, search_item: Dict[str, Any]) -> Optional[tuple[str, str, str]]:
+    def fetch_kernel(self, search_item: dict[str, Any]) -> tuple[str, str, str] | None:
         """
         Fetch kernel code and metadata from GitHub.
 
@@ -96,7 +95,6 @@ class IngestionPipeline:
         try:
             repo = search_item.get("repository", {}).get("full_name", "")
             file_path = search_item.get("path", "")
-            sha = search_item.get("sha", "")
 
             if not repo or not file_path:
                 return None
@@ -114,7 +112,7 @@ class IngestionPipeline:
             logger.warning(f"Failed to fetch kernel {search_item.get('path')}: {e}")
             return None
 
-    def process_kernel(self, repo: str, file_path: str, raw_code: str) -> Optional[KernelRecord]:
+    def process_kernel(self, repo: str, file_path: str, raw_code: str) -> KernelRecord | None:
         """
         Process a single kernel: filter and annotate.
 
@@ -160,7 +158,7 @@ class IngestionPipeline:
 
         return record
 
-    def _get_checkpoint(self) -> Optional[Dict[str, Any]]:
+    def _get_checkpoint(self) -> dict[str, Any] | None:
         """Load checkpoint from database."""
         if self.dry_run:
             return None
@@ -172,7 +170,7 @@ class IngestionPipeline:
             logger.warning(f"Failed to load checkpoint: {e}")
         return None
 
-    def _save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+    def _save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
         """Save checkpoint to database."""
         if self.dry_run:
             logger.debug(f"Dry run: would save checkpoint: {checkpoint}")
@@ -191,7 +189,7 @@ class IngestionPipeline:
         except Exception as e:
             logger.warning(f"Failed to clear checkpoint: {e}")
 
-    def run_batch(self, max_kernels: int = 10) -> Dict[str, int]:
+    def run_batch(self, max_kernels: int = 10) -> dict[str, int]:
         """
         Run a batch of the ingestion pipeline.
 
@@ -229,7 +227,7 @@ class IngestionPipeline:
         logger.info(f"Found {len(search_results)} search results")
 
         # Collect records to insert
-        records_to_insert: List[KernelRecord] = []
+        records_to_insert: list[KernelRecord] = []
 
         for item in search_results:
             if stats["fetched"] >= max_kernels:
@@ -280,7 +278,7 @@ class IngestionPipeline:
         logger.info(f"Batch complete: {stats}")
         return stats
 
-    def run(self, max_kernels: int = 10) -> Dict[str, Any]:
+    def run(self, max_kernels: int = 10) -> dict[str, Any]:
         """
         Run the full ingestion pipeline.
 
@@ -293,7 +291,7 @@ class IngestionPipeline:
         try:
             self.initialize()
             batch_stats = self.run_batch(max_kernels=max_kernels)
-            
+
             if self.dry_run:
                 db_stats = {"total_kernels": 0, "by_domain": {}}
             else:

@@ -1,14 +1,16 @@
 """GitHub API client with rate limiting, pagination, and checkpointing support."""
 
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
+
 import requests
 from tenacity import (
     retry,
+    retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
-    retry_if_exception_type,
 )
+
 from src.core.logger import get_logger
 
 logger = get_logger(__name__)
@@ -40,7 +42,7 @@ class GitHubClient:
         stop=stop_after_attempt(5),
         reraise=True,
     )
-    def _request(self, method: str, url: str, **kwargs) -> Dict[str, Any]:
+    def _request(self, method: str, url: str, **kwargs) -> dict[str, Any]:
         """
         Make an HTTP request with retry logic for rate limits.
 
@@ -78,9 +80,9 @@ class GitHubClient:
         query: str,
         per_page: int = 30,
         page: int = 1,
-        sort: Optional[str] = None,
+        sort: str | None = None,
         order: str = "desc",
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Search for code using GitHub's search API.
 
@@ -107,7 +109,7 @@ class GitHubClient:
         logger.info(f"Searching GitHub: {query} (page {page})")
         return self._request("GET", url, params=params)
 
-    def get_file_content(self, repo: str, path: str, ref: Optional[str] = None) -> Dict[str, Any]:
+    def get_file_content(self, repo: str, path: str, ref: str | None = None) -> dict[str, Any]:
         """
         Get the content of a file from a repository.
 
@@ -125,7 +127,7 @@ class GitHubClient:
         logger.debug(f"Fetching file: {repo}/{path}")
         return self._request("GET", url, params=params)
 
-    def get_commits(self, repo: str, per_page: int = 30, sha: Optional[str] = None) -> List[Dict[str, Any]]:
+    def get_commits(self, repo: str, per_page: int = 30, sha: str | None = None) -> list[dict[str, Any]]:
         """
         Get commits for a repository.
 
@@ -150,7 +152,7 @@ class GitHubClient:
         query: str,
         max_results: int = 100,
         start_page: int = 1,
-    ) -> Tuple[List[Dict[str, Any]], int]:
+    ) -> tuple[list[dict[str, Any]], int]:
         """
         Search for CUDA files with automatic pagination.
         Returns results and the final page reached for checkpointing.
@@ -196,11 +198,11 @@ class GitHubClient:
         self,
         query: str,
         max_results: int = 100,
-        checkpoint_data: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        checkpoint_data: dict[str, Any] | None = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """
         Search for CUDA files with checkpoint support for resume after crash/timeout.
-        
+
         Args:
             query: Additional search query terms
             max_results: Maximum number of results to fetch
@@ -212,7 +214,7 @@ class GitHubClient:
         # Start from checkpoint or beginning
         start_page = 1
         processed_count = 0
-        
+
         if checkpoint_data:
             if checkpoint_data.get("query") == query:
                 start_page = checkpoint_data.get("page", 1) + 1
@@ -220,7 +222,7 @@ class GitHubClient:
                 logger.info(f"Resuming from checkpoint: page {start_page}, processed {processed_count}")
             else:
                 logger.info("Query changed, starting fresh")
-        
+
         all_items = []
         page = start_page
         per_page = 30
