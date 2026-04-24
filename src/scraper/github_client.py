@@ -1,7 +1,7 @@
-"""GitHub API client with rate limiting and pagination support."""
+"""GitHub API client with rate limiting, pagination, and checkpointing support."""
 
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import requests
 from tenacity import (
     retry,
@@ -15,7 +15,7 @@ logger = get_logger(__name__)
 
 
 class GitHubClient:
-    """GitHub API client with robust rate limiting handling."""
+    """GitHub API client with robust rate limiting handling and checkpoint support."""
 
     BASE_URL = "https://api.github.com"
 
@@ -149,19 +149,22 @@ class GitHubClient:
         self,
         query: str,
         max_results: int = 100,
-    ) -> List[Dict[str, Any]]:
+        start_page: int = 1,
+    ) -> Tuple[List[Dict[str, Any]], int]:
         """
         Search for CUDA files with automatic pagination.
+        Returns results and the final page reached for checkpointing.
 
         Args:
             query: Additional search query terms
             max_results: Maximum number of results to fetch
+            start_page: Page to start from (for resume support)
 
         Returns:
-            List of search result items
+            Tuple of (list of search result items, final page number)
         """
         all_items = []
-        page = 1
+        page = start_page
         per_page = 30
 
         while len(all_items) < max_results:
@@ -177,7 +180,7 @@ class GitHubClient:
                 break
 
             all_items.extend(items)
-            logger.info(f"Fetched {len(items)} items (total: {len(all_items)})")
+            logger.info(f"Fetched {len(items)} items (total: {len(all_items)}, page {page})")
 
             # Check if we've reached the last page
             if len(items) < per_page or len(all_items) >= max_results:
@@ -187,4 +190,70 @@ class GitHubClient:
             # Be respectful of rate limits between pages
             time.sleep(2)
 
-        return all_items[:max_results]
+        return all_items[:max_results], page
+
+    def search_cuda_files_with_checkpoint(
+        self,
+        query: str,
+        max_results: int = 100,
+        checkpoint_data: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """
+        Search for CUDA files with checkpoint support for resume after crash/timeout.
+        
+        Args:
+            query: Additional search query terms
+            max_results: Maximum number of results to fetch
+            checkpoint_data: Previous checkpoint state (query, page, processed_count)
+
+        Returns:
+            Tuple of (list of search result items, checkpoint data for resume)
+        """
+        # Start from checkpoint or beginning
+        start_page = 1
+        processed_count = 0
+        
+        if checkpoint_data:
+            if checkpoint_data.get("query") == query:
+                start_page = checkpoint_data.get("page", 1) + 1
+                processed_count = checkpoint_data.get("processed_count", 0)
+                logger.info(f"Resuming from checkpoint: page {start_page}, processed {processed_count}")
+            else:
+                logger.info("Query changed, starting fresh")
+        
+        all_items = []
+        page = start_page
+        per_page = 30
+
+        while len(all_items) < max_results:
+            remaining = max_results - len(all_items)
+            results = self.search_code(
+                query=f"{query} language:CUDA",
+                per_page=min(per_page, remaining),
+                page=page,
+            )
+
+            items = results.get("items", [])
+            if not items:
+                break
+
+            all_items.extend(items)
+            processed_count += len(items)
+            logger.info(f"Fetched {len(items)} items (total: {len(all_items)}, page {page})")
+
+            # Check if we've reached the last page
+            if len(items) < per_page or processed_count >= max_results:
+                break
+
+            page += 1
+            # Be respectful of rate limits between pages
+            time.sleep(2)
+
+        # Prepare checkpoint data
+        checkpoint = {
+            "query": query,
+            "page": page,
+            "processed_count": processed_count,
+        }
+
+        return all_items[:max_results], checkpoint

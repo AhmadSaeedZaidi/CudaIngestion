@@ -18,6 +18,7 @@ pydantic = "^2.5.3"
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.4.4"
 pytest-asyncio = "^0.23.3"
+ruff = "^0.1.6"
 
 [build-system]
 requires = ["poetry-core"]
@@ -25,3 +26,17 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry.scripts]
 cuda-ingest = "src.main:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"

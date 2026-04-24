@@ -1,6 +1,7 @@
 """CUDA Kernel Ingestion Pipeline - Main Entry Point."""
 
 import base64
+import json
 import sys
 import time
 from typing import Any, Dict, List, Optional
@@ -24,9 +25,18 @@ class IngestionPipeline:
     Orchestrates scraping, filtering, annotation, and storage.
     """
 
-    def __init__(self):
-        """Initialize the pipeline with configuration."""
+    # Checkpoint keys
+    CHECKPOINT_KEY = "github_search_checkpoint"
+
+    def __init__(self, dry_run: bool = False):
+        """
+        Initialize the pipeline with configuration.
+
+        Args:
+            dry_run: If True, skip external API calls (MiniMax, database writes)
+        """
         self.config = get_config()
+        self.dry_run = dry_run or self.config.dry_run
         self.github_client = GitHubClient(self.config.github_token)
         self.query_builder = QueryBuilder()
         self.cuda_filter = CUDAFilter(
@@ -39,10 +49,13 @@ class IngestionPipeline:
         )
         self.db_client = DatabaseClient(self.config.neon_uri)
 
-        logger.info("Pipeline initialized")
+        logger.info(f"Pipeline initialized (dry_run={self.dry_run})")
 
     def initialize(self) -> None:
         """Initialize database schema."""
+        if self.dry_run:
+            logger.info("Dry run: skipping database schema initialization")
+            return
         self.db_client.init_schema()
         logger.info("Database schema ready")
 
@@ -126,8 +139,12 @@ class IngestionPipeline:
         except Exception:
             commit_hash = "unknown"
 
-        # Annotate with MiniMax M2.7
-        annotation = self.annotator.annotate(raw_code)
+        # Annotate with MiniMax M2.7 (skip in dry run)
+        annotation = None
+        if not self.dry_run:
+            annotation = self.annotator.annotate(raw_code)
+        else:
+            logger.debug(f"Dry run: skipping MiniMax annotation for {repo}/{file_path}")
 
         # Create kernel record
         record = KernelRecord(
@@ -143,6 +160,37 @@ class IngestionPipeline:
 
         return record
 
+    def _get_checkpoint(self) -> Optional[Dict[str, Any]]:
+        """Load checkpoint from database."""
+        if self.dry_run:
+            return None
+        try:
+            checkpoint_json = self.db_client.get_state(self.CHECKPOINT_KEY)
+            if checkpoint_json:
+                return json.loads(checkpoint_json)
+        except Exception as e:
+            logger.warning(f"Failed to load checkpoint: {e}")
+        return None
+
+    def _save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        """Save checkpoint to database."""
+        if self.dry_run:
+            logger.debug(f"Dry run: would save checkpoint: {checkpoint}")
+            return
+        try:
+            self.db_client.set_state(self.CHECKPOINT_KEY, json.dumps(checkpoint))
+        except Exception as e:
+            logger.warning(f"Failed to save checkpoint: {e}")
+
+    def _clear_checkpoint(self) -> None:
+        """Clear checkpoint after successful completion."""
+        if self.dry_run:
+            return
+        try:
+            self.db_client.delete_state(self.CHECKPOINT_KEY)
+        except Exception as e:
+            logger.warning(f"Failed to clear checkpoint: {e}")
+
     def run_batch(self, max_kernels: int = 10) -> Dict[str, int]:
         """
         Run a batch of the ingestion pipeline.
@@ -153,7 +201,7 @@ class IngestionPipeline:
         Returns:
             Statistics dictionary
         """
-        logger.info(f"Starting batch ingestion (max: {max_kernels})")
+        logger.info(f"Starting batch ingestion (max: {max_kernels}, dry_run={self.dry_run})")
 
         stats = {
             "fetched": 0,
@@ -163,12 +211,21 @@ class IngestionPipeline:
             "inserted": 0,
         }
 
+        # Load checkpoint if exists
+        checkpoint = self._get_checkpoint()
+        if checkpoint:
+            logger.info(f"Resuming from checkpoint: {checkpoint}")
+
         # Generate diverse search query
         query = self.query_builder.get_next_query()
         logger.info(f"Using search query: {query}")
 
-        # Search for CUDA files
-        search_results = self.github_client.search_cuda_files(query, max_results=max_kernels * 2)
+        # Search for CUDA files with checkpoint support
+        search_results, new_checkpoint = self.github_client.search_cuda_files_with_checkpoint(
+            query=query,
+            max_results=max_kernels * 2,
+            checkpoint_data=checkpoint,
+        )
         logger.info(f"Found {len(search_results)} search results")
 
         # Collect records to insert
@@ -179,6 +236,10 @@ class IngestionPipeline:
                 break
 
             stats["fetched"] += 1
+
+            # Save checkpoint periodically (every 10 items)
+            if stats["fetched"] % 10 == 0:
+                self._save_checkpoint(new_checkpoint)
 
             # Fetch kernel content
             kernel_data = self.fetch_kernel(item)
@@ -199,11 +260,22 @@ class IngestionPipeline:
             # Respectful delay between API calls
             time.sleep(1)
 
-        # Batch insert into database
+        # Save checkpoint after processing
+        self._save_checkpoint(new_checkpoint)
+
+        # Batch insert into database (skip in dry run)
         if records_to_insert:
-            inserted = self.db_client.insert_batch(records_to_insert)
-            stats["inserted"] = inserted
-            stats["duplicates"] = len(records_to_insert) - inserted
+            if self.dry_run:
+                logger.info(f"Dry run: would insert {len(records_to_insert)} records")
+                stats["inserted"] = len(records_to_insert)
+            else:
+                inserted = self.db_client.insert_batch(records_to_insert)
+                stats["inserted"] = inserted
+                stats["duplicates"] = len(records_to_insert) - inserted
+
+        # Clear checkpoint on successful completion
+        if stats["inserted"] > 0 or stats["annotated"] > 0:
+            self._clear_checkpoint()
 
         logger.info(f"Batch complete: {stats}")
         return stats
@@ -221,11 +293,16 @@ class IngestionPipeline:
         try:
             self.initialize()
             batch_stats = self.run_batch(max_kernels=max_kernels)
-            db_stats = self.db_client.get_stats()
+            
+            if self.dry_run:
+                db_stats = {"total_kernels": 0, "by_domain": {}}
+            else:
+                db_stats = self.db_client.get_stats()
 
             return {
                 "batch": batch_stats,
                 "database": db_stats,
+                "dry_run": self.dry_run,
             }
 
         except Exception as e:
@@ -233,7 +310,8 @@ class IngestionPipeline:
             raise
 
         finally:
-            self.cleanup()
+            if not self.dry_run:
+                self.cleanup()
 
     def cleanup(self) -> None:
         """Clean up resources."""
@@ -252,13 +330,20 @@ def main() -> None:
         default=10,
         help="Maximum number of kernels to process (default: 10)",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Run without making external API calls or database writes",
+    )
     args = parser.parse_args()
 
     logger.info("=" * 60)
     logger.info("CUDA Kernel Ingestion Pipeline Starting")
+    logger.info(f"Dry run: {args.dry_run}")
     logger.info("=" * 60)
 
-    pipeline = IngestionPipeline()
+    pipeline = IngestionPipeline(dry_run=args.dry_run)
     results = pipeline.run(max_kernels=args.max_kernels)
 
     logger.info("=" * 60)
@@ -269,6 +354,7 @@ def main() -> None:
     logger.info(f"  Batch annotated: {results['batch']['annotated']}")
     logger.info(f"  Batch inserted: {results['batch']['inserted']}")
     logger.info(f"  Duplicates skipped: {results['batch']['duplicates']}")
+    logger.info(f"  Dry run: {results['dry_run']}")
     logger.info("=" * 60)
 
 

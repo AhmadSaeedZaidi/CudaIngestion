@@ -1,14 +1,15 @@
-name: CUDA Kernel Ingestion Pipeline (Production)
+name: CI Pipeline (Development)
 
 on:
-  schedule:
-    - cron: "0 0 * * *"
-  workflow_dispatch:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
 
 jobs:
-  ingest:
+  ci:
     runs-on: ubuntu-latest
-    environment: prod  # Use production environment with prod secrets
+    environment: dev  # Use development environment with dev secrets
     
     steps:
       - name: Checkout code
@@ -26,18 +27,21 @@ jobs:
       - name: Install dependencies
         run: poetry install
 
-      - name: Run ingestion pipeline
+      - name: Run Ruff linter
+        run: poetry run ruff check src/
+
+      - name: Run tests with pytest
         env:
           NEON_URI: ${{ secrets.NEON_URI }}
           TOKEN_GITHUB: ${{ secrets.TOKEN_GITHUB }}
           MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
-          BATCH_SIZE: 10
-        run: poetry run cuda-ingest --max-kernels 10
+          DRY_RUN: true  # Run tests in dry-run mode
+        run: poetry run pytest tests/ -v
 
-      - name: Upload logs
+      - name: Upload test logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pipeline-logs-prod
+          name: test-logs
           path: "*.log"
-          retention-days: 7
+          retention-days: 3

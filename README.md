@@ -115,4 +115,4 @@ cuda-ingest-pipeline/
 
 ## License
 
-MIT
+Apache 2.0
