@@ -1,7 +1,7 @@
 """GitHub API client with rate limiting, pagination, and checkpointing support."""
 
 import time
-from typing import Any
+from typing import Any, Tuple, List, Dict, Optional
 
 import requests
 from tenacity import (
@@ -42,17 +42,9 @@ class GitHubClient:
         stop=stop_after_attempt(5),
         reraise=True,
     )
-    def _request(self, method: str, url: str, **kwargs) -> dict[str, Any]:
+    def _request(self, method: str, url: str, **kwargs) -> Dict[str, Any]:
         """
         Make an HTTP request with retry logic for rate limits.
-
-        Args:
-            method: HTTP method (GET, POST, etc.)
-            url: Request URL
-            **kwargs: Additional request arguments
-
-        Returns:
-            JSON response as dictionary
         """
         response = self.session.request(method, url, **kwargs)
 
@@ -75,22 +67,38 @@ class GitHubClient:
         response.raise_for_status()
         return response.json()
 
+    def search_repositories(
+        self,
+        query: str,
+        per_page: int = 30,
+        page: int = 1,
+        sort: str = "stars",
+        order: str = "desc",
+    ) -> Dict[str, Any]:
+        """
+        Search for repositories to act as a quality filter.
+        """
+        url = f"{self.BASE_URL}/search/repositories"
+        params = {
+            "q": query,
+            "per_page": min(per_page, 100),
+            "page": page,
+            "sort": sort,
+            "order": order,
+        }
+        
+        logger.info(f"Searching Repos: {query} (page {page})")
+        return self._request("GET", url, params=params)
+
     def search_code(
         self,
         query: str,
         per_page: int = 30,
         page: int = 1,
-    ) -> dict[str, Any]:
+    ) -> Dict[str, Any]:
         """
         Search for code using GitHub's search API.
-
-        Args:
-            query: Search query string (can include stars:>50 fork:false etc.)
-            per_page: Results per page (max 100)
-            page: Page number
-
-        Returns:
-            Search results with items and metadata
+        NOTE: /search/code does not support sorting.
         """
         url = f"{self.BASE_URL}/search/code"
         params = {
@@ -99,39 +107,19 @@ class GitHubClient:
             "page": page,
         }
 
-        logger.info(f"Searching GitHub: {query} (page {page})")
+        logger.info(f"Searching Code: {query} (page {page})")
         return self._request("GET", url, params=params)
 
-    def get_file_content(self, repo: str, path: str, ref: str | None = None) -> dict[str, Any]:
-        """
-        Get the content of a file from a repository.
-
-        Args:
-            repo: Repository in 'owner/name' format
-            path: Path to the file within the repository
-            ref: Git reference (branch, commit, tag)
-
-        Returns:
-            File metadata including content (base64 encoded)
-        """
+    def get_file_content(self, repo: str, path: str, ref: Optional[str] = None) -> Dict[str, Any]:
+        """Get the content of a file from a repository."""
         url = f"{self.BASE_URL}/repos/{repo}/contents/{path}"
         params = {"ref": ref} if ref else {}
 
         logger.debug(f"Fetching file: {repo}/{path}")
         return self._request("GET", url, params=params)
 
-    def get_commits(self, repo: str, per_page: int = 30, sha: str | None = None) -> list[dict[str, Any]]:
-        """
-        Get commits for a repository.
-
-        Args:
-            repo: Repository in 'owner/name' format
-            per_page: Results per page
-            sha: SHA or branch to start listing commits from
-
-        Returns:
-            List of commit objects
-        """
+    def get_commits(self, repo: str, per_page: int = 30, sha: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Get commits for a repository."""
         url = f"{self.BASE_URL}/repos/{repo}/commits"
         params = {"per_page": per_page}
         if sha:
@@ -144,117 +132,124 @@ class GitHubClient:
         self,
         query: str,
         max_results: int = 100,
-        start_page: int = 1,
-    ) -> tuple[list[dict[str, Any]], int]:
+    ) -> List[Dict[str, Any]]:
         """
-        Search for CUDA files with automatic pagination.
-        Returns results and the final page reached for checkpointing.
-
-        Note: Quality constraints (stars:>50, fork:false) should be included
-        in the query string. The /search/code endpoint does not support
-        separate sort/order parameters.
-
-        Args:
-            query: Additional search query terms (should include stars:>50 fork:false)
-            max_results: Maximum number of results to fetch
-            start_page: Page to start from (for resume support)
-
-        Returns:
-            Tuple of (list of search result items, final page number)
+        Search for CUDA files by first finding highly-rated repositories,
+        then searching for code within them.
         """
         all_items = []
-        page = start_page
-        per_page = 30
+        
+        # Step 1: Fetch top-starred CUDA repositories
+        repos_data = self.search_repositories("language:CUDA stars:>50", per_page=50)
+        top_repos = [item["full_name"] for item in repos_data.get("items", [])]
+        
+        if not top_repos:
+            logger.warning("No high-quality CUDA repositories found.")
+            return []
 
-        while len(all_items) < max_results:
-            remaining = max_results - len(all_items)
-            results = self.search_code(
-                query=f"{query} language:CUDA",
-                per_page=min(per_page, remaining),
-                page=page,
-            )
-
-            items = results.get("items", [])
-            if not items:
+        # Step 2: Search code within those specific repositories
+        for repo_name in top_repos:
+            if len(all_items) >= max_results:
                 break
+                
+            page = 1
+            while len(all_items) < max_results:
+                remaining = max_results - len(all_items)
+                
+                # Scope query to the specific high-quality repo
+                repo_query = f"{query} language:CUDA repo:{repo_name}"
+                
+                results = self.search_code(
+                    query=repo_query,
+                    per_page=min(30, remaining),
+                    page=page,
+                )
 
-            all_items.extend(items)
-            logger.info(f"Fetched {len(items)} items (total: {len(all_items)}, page {page})")
+                items = results.get("items", [])
+                if not items:
+                    break # No more results in this repo
 
-            # Check if we've reached the last page
-            if len(items) < per_page or len(all_items) >= max_results:
-                break
+                all_items.extend(items)
+                logger.info(f"Fetched {len(items)} items from {repo_name} (total: {len(all_items)})")
 
-            page += 1
-            # Be respectful of rate limits between pages
-            time.sleep(2)
+                if len(items) < 30:
+                    break # Reached the last page for this repo
 
-        return all_items[:max_results], page
+                page += 1
+                time.sleep(2) # Respect secondary rate limits
+
+            time.sleep(2) # Delay between repository switches
+
+        return all_items[:max_results]
 
     def search_cuda_files_with_checkpoint(
         self,
         query: str,
         max_results: int = 100,
-        checkpoint_data: dict[str, Any] | None = None,
-    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        checkpoint_data: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """
         Search for CUDA files with checkpoint support for resume after crash/timeout.
-
-        Note: Quality constraints (stars:>50, fork:false) should be included
-        in the query string. The /search/code endpoint does not support
-        separate sort/order parameters.
-
-        Args:
-            query: Additional search query terms (should include stars:>50 fork:false)
-            max_results: Maximum number of results to fetch
-            checkpoint_data: Previous checkpoint state (query, page, processed_count)
-
-        Returns:
-            Tuple of (list of search result items, checkpoint data for resume)
+        Implements the two-step repo-then-code architecture.
         """
-        # Start from checkpoint or beginning
-        start_page = 1
+        # Default state
+        repo_index = 0
+        page = 1
         processed_count = 0
 
+        # Resume from checkpoint if valid
         if checkpoint_data:
             if checkpoint_data.get("query") == query:
-                start_page = checkpoint_data.get("page", 1) + 1
+                repo_index = checkpoint_data.get("repo_index", 0)
+                page = checkpoint_data.get("page", 1)
                 processed_count = checkpoint_data.get("processed_count", 0)
-                logger.info(f"Resuming from checkpoint: page {start_page}, processed {processed_count}")
+                logger.info(f"Resuming: Repo index {repo_index}, page {page}, processed {processed_count}")
             else:
                 logger.info("Query changed, starting fresh")
 
         all_items = []
-        page = start_page
-        per_page = 30
+        
+        # Step 1: Fetch stable list of top-starred repos to use as our pool
+        repos_data = self.search_repositories("language:CUDA stars:>50", per_page=50)
+        top_repos = [item["full_name"] for item in repos_data.get("items", [])]
 
-        while len(all_items) < max_results:
-            remaining = max_results - len(all_items)
+        if not top_repos:
+            return [], {"query": query, "repo_index": 0, "page": 1, "processed_count": 0}
+
+        # Step 2: Iterate and search
+        while processed_count < max_results and repo_index < len(top_repos):
+            repo_name = top_repos[repo_index]
+            remaining = max_results - processed_count
+
+            repo_query = f"{query} language:CUDA repo:{repo_name}"
+
             results = self.search_code(
-                query=f"{query} language:CUDA",
-                per_page=min(per_page, remaining),
+                query=repo_query,
+                per_page=min(30, remaining),
                 page=page,
             )
 
             items = results.get("items", [])
-            if not items:
-                break
+            
+            if items:
+                all_items.extend(items)
+                processed_count += len(items)
+                logger.info(f"Fetched {len(items)} items from {repo_name} (total processed: {processed_count})")
 
-            all_items.extend(items)
-            processed_count += len(items)
-            logger.info(f"Fetched {len(items)} items (total: {len(all_items)}, page {page})")
+            # Pagination and repo-switching logic
+            if len(items) == 30 and processed_count < max_results:
+                page += 1
+                time.sleep(2)
+            else:
+                # Exhausted this repo, move to the next one
+                repo_index += 1
+                page = 1 
+                time.sleep(2)
 
-            # Check if we've reached the last page
-            if len(items) < per_page or processed_count >= max_results:
-                break
-
-            page += 1
-            # Be respectful of rate limits between pages
-            time.sleep(2)
-
-        # Prepare checkpoint data
+        # Prepare checkpoint data representing the exact state to resume from
         checkpoint = {
             "query": query,
+            "repo_index": repo_index,
             "page": page,
             "processed_count": processed_count,
         }
