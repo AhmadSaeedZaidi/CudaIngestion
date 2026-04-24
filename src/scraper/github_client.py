@@ -1,7 +1,7 @@
 """GitHub API client with rate limiting, pagination, and checkpointing support."""
 
 import time
-from typing import Any, Tuple, List, Dict, Optional
+from typing import Any
 
 import requests
 from tenacity import (
@@ -42,7 +42,7 @@ class GitHubClient:
         stop=stop_after_attempt(5),
         reraise=True,
     )
-    def _request(self, method: str, url: str, **kwargs) -> Dict[str, Any]:
+    def _request(self, method: str, url: str, **kwargs) -> dict[str, Any]:
         """
         Make an HTTP request with retry logic for rate limits.
         """
@@ -74,7 +74,7 @@ class GitHubClient:
         page: int = 1,
         sort: str = "stars",
         order: str = "desc",
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Search for repositories to act as a quality filter.
         """
@@ -86,7 +86,7 @@ class GitHubClient:
             "sort": sort,
             "order": order,
         }
-        
+
         logger.info(f"Searching Repos: {query} (page {page})")
         return self._request("GET", url, params=params)
 
@@ -95,7 +95,7 @@ class GitHubClient:
         query: str,
         per_page: int = 30,
         page: int = 1,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """
         Search for code using GitHub's search API.
         NOTE: /search/code does not support sorting.
@@ -110,7 +110,7 @@ class GitHubClient:
         logger.info(f"Searching Code: {query} (page {page})")
         return self._request("GET", url, params=params)
 
-    def get_file_content(self, repo: str, path: str, ref: Optional[str] = None) -> Dict[str, Any]:
+    def get_file_content(self, repo: str, path: str, ref: str | None = None) -> dict[str, Any]:
         """Get the content of a file from a repository."""
         url = f"{self.BASE_URL}/repos/{repo}/contents/{path}"
         params = {"ref": ref} if ref else {}
@@ -118,7 +118,7 @@ class GitHubClient:
         logger.debug(f"Fetching file: {repo}/{path}")
         return self._request("GET", url, params=params)
 
-    def get_commits(self, repo: str, per_page: int = 30, sha: Optional[str] = None) -> List[Dict[str, Any]]:
+    def get_commits(self, repo: str, per_page: int = 30, sha: str | None = None) -> list[dict[str, Any]]:
         """Get commits for a repository."""
         url = f"{self.BASE_URL}/repos/{repo}/commits"
         params = {"per_page": per_page}
@@ -132,17 +132,17 @@ class GitHubClient:
         self,
         query: str,
         max_results: int = 100,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """
         Search for CUDA files by first finding highly-rated repositories,
         then searching for code within them.
         """
         all_items = []
-        
+
         # Step 1: Fetch top-starred CUDA repositories
         repos_data = self.search_repositories("language:CUDA stars:>50", per_page=50)
         top_repos = [item["full_name"] for item in repos_data.get("items", [])]
-        
+
         if not top_repos:
             logger.warning("No high-quality CUDA repositories found.")
             return []
@@ -151,14 +151,14 @@ class GitHubClient:
         for repo_name in top_repos:
             if len(all_items) >= max_results:
                 break
-                
+
             page = 1
             while len(all_items) < max_results:
                 remaining = max_results - len(all_items)
-                
+
                 # Scope query to the specific high-quality repo
                 repo_query = f"{query} language:CUDA repo:{repo_name}"
-                
+
                 results = self.search_code(
                     query=repo_query,
                     per_page=min(30, remaining),
@@ -186,8 +186,8 @@ class GitHubClient:
         self,
         query: str,
         max_results: int = 100,
-        checkpoint_data: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        checkpoint_data: dict[str, Any] | None = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """
         Search for CUDA files with checkpoint support for resume after crash/timeout.
         Implements the two-step repo-then-code architecture.
@@ -208,7 +208,7 @@ class GitHubClient:
                 logger.info("Query changed, starting fresh")
 
         all_items = []
-        
+
         # Step 1: Fetch stable list of top-starred repos to use as our pool
         repos_data = self.search_repositories("language:CUDA stars:>50", per_page=50)
         top_repos = [item["full_name"] for item in repos_data.get("items", [])]
@@ -230,7 +230,7 @@ class GitHubClient:
             )
 
             items = results.get("items", [])
-            
+
             if items:
                 all_items.extend(items)
                 processed_count += len(items)
@@ -243,7 +243,7 @@ class GitHubClient:
             else:
                 # Exhausted this repo, move to the next one
                 repo_index += 1
-                page = 1 
+                page = 1
                 time.sleep(2)
 
         # Prepare checkpoint data representing the exact state to resume from
