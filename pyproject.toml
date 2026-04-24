@@ -1,0 +1,27 @@
+[tool.poetry]
+name = "cuda-ingest-pipeline"
+version = "0.1.0"
+description = "Automated CUDA kernel ingestion and annotation pipeline"
+authors = ["Your Name <your.email@example.com>"]
+readme = "README.md"
+packages = [{include = "src", from = "."}]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+requests = "^2.31.0"
+tenacity = "^8.2.3"
+psycopg2-binary = "^2.9.9"
+sqlalchemy = "^2.0.25"
+python-dotenv = "^1.0.0"
+pydantic = "^2.5.3"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.4.4"
+pytest-asyncio = "^0.23.3"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.scripts]
+cuda-ingest = "src.main:main"

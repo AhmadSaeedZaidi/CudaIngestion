@@ -1,0 +1,269 @@
+"""Neon PostgreSQL client with connection pooling and deduplication."""
+
+import hashlib
+from contextlib import contextmanager
+from typing import Any, Dict, Generator, List, Optional
+from dataclasses import dataclass
+
+from sqlalchemy import create_engine, text
+from sqlalchemy.pool import NullPool
+from sqlalchemy.engine import Engine
+
+from src.core.logger import get_logger
+
+logger = get_logger(__name__)
+
+
+@dataclass
+class KernelRecord:
+    """A CUDA kernel record for database operations."""
+    repo_name: str
+    file_path: str
+    commit_hash: str
+    raw_code: str
+    domain_tag: Optional[str] = None
+    algorithmic_intent: Optional[str] = None
+    memory_pattern: Optional[str] = None
+    hardware_utilization: Optional[str] = None
+
+
+class DatabaseClient:
+    """
+    Neon PostgreSQL database client with connection pooling.
+    Handles deduplication via code_hash to avoid redundant API costs.
+    """
+
+    def __init__(self, connection_uri: str):
+        """
+        Initialize database client.
+
+        Args:
+            connection_uri: Neon PostgreSQL connection URI
+        """
+        self.engine: Engine = create_engine(
+            connection_uri,
+            poolclass=NullPool,  # Neon serverless works better with NullPool
+            connect_args={
+                "connect_timeout": 30,
+            },
+        )
+        logger.info("Database client initialized")
+
+    def init_schema(self) -> None:
+        """Initialize database schema if not exists."""
+        with self.engine.connect() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS kernels (
+                    id SERIAL PRIMARY KEY,
+                    repo_name VARCHAR(255) NOT NULL,
+                    file_path TEXT NOT NULL,
+                    commit_hash VARCHAR(40) NOT NULL,
+                    raw_code TEXT NOT NULL,
+                    code_hash VARCHAR(64) UNIQUE NOT NULL,
+                    domain_tag VARCHAR(100),
+                    algorithmic_intent TEXT,
+                    memory_pattern TEXT,
+                    hardware_utilization TEXT,
+                    ingested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
+            # Create indexes for common queries
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_code_hash ON kernels(code_hash)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_domain_tag ON kernels(domain_tag)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ingested_at ON kernels(ingested_at)"))
+            conn.commit()
+        logger.info("Database schema initialized")
+
+    def compute_code_hash(self, code: str) -> str:
+        """
+        Compute SHA-256 hash of code for deduplication.
+
+        Args:
+            code: Raw CUDA code
+
+        Returns:
+            Hexadecimal hash string
+        """
+        return hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+    def check_duplicate(self, code_hash: str) -> bool:
+        """
+        Check if a kernel with this hash already exists.
+
+        Args:
+            code_hash: SHA-256 hash of the code
+
+        Returns:
+            True if duplicate exists
+        """
+        with self.engine.connect() as conn:
+            result = conn.execute(
+                text("SELECT 1 FROM kernels WHERE code_hash = :hash LIMIT 1"),
+                {"hash": code_hash}
+            )
+            return result.fetchone() is not None
+
+    def get_existing_hashes(self, code_hashes: List[str]) -> set[str]:
+        """
+        Check multiple hashes at once for efficiency.
+
+        Args:
+            code_hashes: List of code hashes to check
+
+        Returns:
+            Set of hashes that already exist
+        """
+        if not code_hashes:
+            return set()
+
+        with self.engine.connect() as conn:
+            placeholders = ", ".join([f":hash{i}" for i in range(len(code_hashes))])
+            params = {f"hash{i}": h for i, h in enumerate(code_hashes)}
+            result = conn.execute(
+                text(f"SELECT code_hash FROM kernels WHERE code_hash IN ({placeholders})"),
+                params
+            )
+            return {row[0] for row in result.fetchall()}
+
+    def insert_kernel(self, record: KernelRecord) -> bool:
+        """
+        Insert a kernel record into the database.
+
+        Args:
+            record: KernelRecord to insert
+
+        Returns:
+            True if inserted successfully, False if duplicate
+        """
+        code_hash = self.compute_code_hash(record.raw_code)
+
+        # Check for duplicate before inserting
+        if self.check_duplicate(code_hash):
+            logger.debug(f"Duplicate kernel detected: {record.repo_name}/{record.file_path}")
+            return False
+
+        with self.engine.connect() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO kernels 
+                    (repo_name, file_path, commit_hash, raw_code, code_hash, 
+                     domain_tag, algorithmic_intent, memory_pattern, hardware_utilization)
+                    VALUES 
+                    (:repo_name, :file_path, :commit_hash, :raw_code, :code_hash,
+                     :domain_tag, :algorithmic_intent, :memory_pattern, :hardware_utilization)
+                """),
+                {
+                    "repo_name": record.repo_name,
+                    "file_path": record.file_path,
+                    "commit_hash": record.commit_hash,
+                    "raw_code": record.raw_code,
+                    "code_hash": code_hash,
+                    "domain_tag": record.domain_tag,
+                    "algorithmic_intent": record.algorithmic_intent,
+                    "memory_pattern": record.memory_pattern,
+                    "hardware_utilization": record.hardware_utilization,
+                }
+            )
+            conn.commit()
+            logger.info(f"Inserted kernel: {record.repo_name}/{record.file_path}")
+            return True
+
+    def insert_batch(self, records: List[KernelRecord]) -> int:
+        """
+        Insert multiple kernel records efficiently.
+
+        Args:
+            records: List of KernelRecord to insert
+
+        Returns:
+            Number of records actually inserted (excluding duplicates)
+        """
+        if not records:
+            return 0
+
+        # Compute hashes and check for existing ones
+        records_with_hashes = []
+        for record in records:
+            code_hash = self.compute_code_hash(record.raw_code)
+            records_with_hashes.append((code_hash, record))
+
+        # Batch check for duplicates
+        all_hashes = [r[0] for r in records_with_hashes]
+        existing = self.get_existing_hashes(all_hashes)
+
+        # Filter and insert
+        inserted_count = 0
+        for code_hash, record in records_with_hashes:
+            if code_hash in existing:
+                logger.debug(f"Skipping duplicate: {record.repo_name}/{record.file_path}")
+                continue
+
+            try:
+                with self.engine.connect() as conn:
+                    conn.execute(
+                        text("""
+                            INSERT INTO kernels 
+                            (repo_name, file_path, commit_hash, raw_code, code_hash,
+                             domain_tag, algorithmic_intent, memory_pattern, hardware_utilization)
+                            VALUES 
+                            (:repo_name, :file_path, :commit_hash, :raw_code, :code_hash,
+                             :domain_tag, :algorithmic_intent, :memory_pattern, :hardware_utilization)
+                        """),
+                        {
+                            "repo_name": record.repo_name,
+                            "file_path": record.file_path,
+                            "commit_hash": record.commit_hash,
+                            "raw_code": record.raw_code,
+                            "code_hash": code_hash,
+                            "domain_tag": record.domain_tag,
+                            "algorithmic_intent": record.algorithmic_intent,
+                            "memory_pattern": record.memory_pattern,
+                            "hardware_utilization": record.hardware_utilization,
+                        }
+                    )
+                    conn.commit()
+                    inserted_count += 1
+            except Exception as e:
+                logger.error(f"Failed to insert kernel {record.repo_name}/{record.file_path}: {e}")
+
+        logger.info(f"Batch insert complete: {inserted_count}/{len(records)} inserted")
+        return inserted_count
+
+    def get_stats(self) -> Dict[str, Any]:
+        """
+        Get database statistics.
+
+        Returns:
+            Dictionary with kernel counts by domain and total
+        """
+        with self.engine.connect() as conn:
+            total = conn.execute(text("SELECT COUNT(*) FROM kernels")).scalar()
+
+            by_domain = conn.execute(text("""
+                SELECT domain_tag, COUNT(*) as count 
+                FROM kernels 
+                WHERE domain_tag IS NOT NULL 
+                GROUP BY domain_tag 
+                ORDER BY count DESC
+            """)).fetchall()
+
+            return {
+                "total_kernels": total,
+                "by_domain": dict(by_domain),
+            }
+
+    def close(self) -> None:
+        """Close database connections."""
+        self.engine.dispose()
+        logger.info("Database connections closed")
+
+    @contextmanager
+    def connection(self) -> Generator:
+        """
+        Context manager for database connections.
+
+        Yields:
+            Database connection
+        """
+        with self.engine.connect() as conn:
+            yield conn
