@@ -8,6 +8,7 @@ class QueryBuilder:
     """
     Builds GitHub search queries for CUDA files across diverse computational domains.
     Prevents mode collapse by cycling through different computational fields.
+    Enforces strict quality constraints: stars:>50, fork:false, sorted by stars desc.
     """
 
     # Domain-specific search terms to ensure diverse kernel coverage
@@ -33,8 +34,9 @@ class QueryBuilder:
     # File extensions for CUDA
     EXTENSIONS = ["cu", "cuh"]
 
-    # Minimum stars to filter for quality (can be adjusted)
-    MIN_STARS = 0
+    # Quality constraints: minimum stars and no forks
+    MIN_STARS = 50
+    FORK_FILTER = "fork:false"
 
     def __init__(self, seed: int = 42):
         """
@@ -57,18 +59,20 @@ class QueryBuilder:
 
     def get_next_query(self) -> str:
         """
-        Get the next search query with domain diversity.
+        Get the next search query with domain diversity and quality constraints.
 
         Returns:
-            GitHub search query string
+            GitHub search query string with stars:>50 and fork:false
         """
         domain_terms = next(self._domain_cycle)
-        # Pick one term from the domain randomly (simplified - uses round-robin)
         primary_term = domain_terms[0]
 
+        # Build query with strict quality constraints
         query_parts = [
             f"{primary_term}",
             "extension:cu OR extension:cuh",
+            f"stars:>{self.MIN_STARS}",
+            self.FORK_FILTER,
         ]
 
         return " ".join(query_parts)
@@ -76,16 +80,16 @@ class QueryBuilder:
     def build_query(
         self,
         domain: str,
-        include_stars: bool = False,
-        min_stars: int = 0,
+        min_stars: int = MIN_STARS,
+        include_fork_filter: bool = True,
     ) -> str:
         """
-        Build a custom query for a specific domain.
+        Build a custom query for a specific domain with quality constraints.
 
         Args:
             domain: Domain term to search for
-            include_stars: Whether to filter by stars
-            min_stars: Minimum star count if filtering
+            min_stars: Minimum star count (default: 50)
+            include_fork_filter: Whether to filter out forks (default: True)
 
         Returns:
             GitHub search query string
@@ -93,10 +97,11 @@ class QueryBuilder:
         query_parts = [
             domain,
             "extension:cu OR extension:cuh",
+            f"stars:>{min_stars}",
         ]
 
-        if include_stars and min_stars > 0:
-            query_parts.append(f"stars:>={min_stars}")
+        if include_fork_filter:
+            query_parts.append(self.FORK_FILTER)
 
         return " ".join(query_parts)
 
@@ -105,7 +110,7 @@ class QueryBuilder:
         Get all available domain queries for batch processing.
 
         Returns:
-            List of query strings
+            List of query strings with quality constraints
         """
         queries = []
         for domain_terms in self.DOMAIN_TERMS:
@@ -121,6 +126,6 @@ class QueryBuilder:
             num_queries: Number of queries to return
 
         Returns:
-            List of diverse query strings
+            List of diverse query strings with quality constraints
         """
         return [next(self._domain_cycle)[0] for _ in range(num_queries)]

@@ -48,13 +48,13 @@ Return ONLY the JSON object, no additional text."""
 {code}
 ```"""
 
-    def __init__(self, api_key: str, api_base: str = "https://api.minimaxi.chat/v1"):
+    def __init__(self, api_key: str, api_base: str = "https://api.minimax.io/v1"):
         """
         Initialize MiniMax annotator.
 
         Args:
             api_key: MiniMax API key
-            api_base: API base URL
+            api_base: API base URL (default: international endpoint)
         """
         self.api_key = api_key
         self.api_base = api_base.rstrip("/")
@@ -148,7 +148,7 @@ Return ONLY the JSON object, no additional text."""
 
         user_prompt = self.USER_PROMPT_TEMPLATE.format(code=code)
         payload = {
-            "model": "MiniMax-M2.7-8K",
+            "model": "MiniMax-M2.7",
             "messages": [
                 {"role": "system", "content": self.SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},

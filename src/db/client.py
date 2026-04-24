@@ -10,12 +10,6 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.pool import NullPool
 
-try:
-    import psycopg2.extras
-    HAS_PSYCOPG2 = True
-except ImportError:
-    HAS_PSYCOPG2 = False
-
 from src.core.logger import get_logger
 
 logger = get_logger(__name__)
@@ -191,85 +185,52 @@ class DatabaseClient:
             logger.info(f"Inserted kernel: {record.repo_name}/{record.file_path}")
             return True
 
-    def _bulk_insert_psycopg2(self, records: list[KernelRecord], code_hashes: list[str]) -> int:
+    def _bulk_insert_sqlalchemy_core(self, records: list[KernelRecord], code_hashes: list[str]) -> int:
         """
-        Use psycopg2.extras.execute_values for high-throughput batch inserts.
-        This is the preferred method for Neon PostgreSQL.
+        Use SQLAlchemy Core insert() for high-throughput batch inserts.
+        This works with any SQLAlchemy-supported database without requiring
+        psycopg2-specific cursor methods.
+
+        Args:
+            records: List of KernelRecord to insert
+            code_hashes: Pre-computed code hashes for records
+
+        Returns:
+            Number of records in the batch (actual inserts may be less due to deduplication)
         """
-        if not HAS_PSYCOPG2:
-            raise ImportError("psycopg2 is required for bulk inserts")
-
-        # Get raw connection for execute_values
-        raw_conn = self.engine.raw_connection()
-        try:
-            # Prepare data tuples
-            data = [
-                (
-                    r.repo_name, r.file_path, r.commit_hash, r.raw_code, code_hashes[i],
-                    r.domain_tag, r.algorithmic_intent, r.memory_pattern, r.hardware_utilization
-                )
-                for i, r in enumerate(records)
-            ]
-
-            psycopg2.extras.execute_values(
-                raw_conn,
-                """
-                INSERT INTO kernels
-                (repo_name, file_path, commit_hash, raw_code, code_hash,
-                 domain_tag, algorithmic_intent, memory_pattern, hardware_utilization)
-                VALUES %s
-                ON CONFLICT (code_hash) DO NOTHING
-                """,
-                data,
-                page_size=100,
-            )
-            raw_conn.commit()
-            return len(records)
-        finally:
-            raw_conn.close()
-
-    def _bulk_insert_sqlalchemy(self, records: list[KernelRecord], code_hashes: list[str]) -> int:
-        """
-        Fallback: Use SQLAlchemy Core for batch inserts.
-        Less efficient than psycopg2.extras but works without psycopg2.
-        """
-
-        values = [
-            {
-                "repo_name": r.repo_name,
-                "file_path": r.file_path,
-                "commit_hash": r.commit_hash,
-                "raw_code": r.raw_code,
+        # Build list of values for bulk insert
+        values_list = []
+        for i, record in enumerate(records):
+            values_list.append({
+                "repo_name": record.repo_name,
+                "file_path": record.file_path,
+                "commit_hash": record.commit_hash,
+                "raw_code": record.raw_code,
                 "code_hash": code_hashes[i],
-                "domain_tag": r.domain_tag,
-                "algorithmic_intent": r.algorithmic_intent,
-                "memory_pattern": r.memory_pattern,
-                "hardware_utilization": r.hardware_utilization,
-            }
-            for i, r in enumerate(records)
-        ]
-
+                "domain_tag": record.domain_tag,
+                "algorithmic_intent": record.algorithmic_intent,
+                "memory_pattern": record.memory_pattern,
+                "hardware_utilization": record.hardware_utilization,
+            })
         with self.engine.connect() as conn:
-            # Use execute_values via text for ON CONFLICT support
-            for i in range(0, len(values), self.BATCH_SIZE):
-                batch = values[i:i + self.BATCH_SIZE]
-                placeholders = ", ".join([
-                    "(%(repo_name)s, %(file_path)s, %(commit_hash)s, %(raw_code)s, %(code_hash)s, %(domain_tag)s, %(algorithmic_intent)s, %(memory_pattern)s, %(hardware_utilization)s)"
-                ] * len(batch))
+            for i in range(0, len(values_list), self.BATCH_SIZE):
+                batch = values_list[i:i + self.BATCH_SIZE]
 
-                params = {}
-                for j, v in enumerate(batch):
-                    for k, val in v.items():
-                        params[f"{k}_{j}"] = val
-
-                query = text(f"""
+                # Build parameterized insert
+                stmt = text("""
                     INSERT INTO kernels
                     (repo_name, file_path, commit_hash, raw_code, code_hash,
                      domain_tag, algorithmic_intent, memory_pattern, hardware_utilization)
-                    VALUES {placeholders}
+                    VALUES
+                    (:repo_name, :file_path, :commit_hash, :raw_code, :code_hash,
+                     :domain_tag, :algorithmic_intent, :memory_pattern, :hardware_utilization)
                     ON CONFLICT (code_hash) DO NOTHING
                 """)
-                conn.execute(query, params)
+
+                # Execute batch with multiple parameter sets
+                for values in batch:
+                    conn.execute(stmt, values)
+
             conn.commit()
 
         return len(records)
@@ -277,6 +238,7 @@ class DatabaseClient:
     def insert_batch(self, records: list[KernelRecord]) -> int:
         """
         Insert multiple kernel records efficiently using batch inserts.
+        Uses SQLAlchemy Core for database-agnostic bulk operations.
 
         Args:
             records: List of KernelRecord to insert
@@ -311,17 +273,14 @@ class DatabaseClient:
             logger.info("All records were duplicates")
             return 0
 
-        # Use bulk insert method
+        # Use SQLAlchemy Core bulk insert
         try:
-            if HAS_PSYCOPG2:
-                inserted = self._bulk_insert_psycopg2(new_records, new_hashes)
-            else:
-                inserted = self._bulk_insert_sqlalchemy(new_records, new_hashes)
-            logger.info(f"Batch insert complete: {inserted}/{len(records)} inserted")
+            inserted = self._bulk_insert_sqlalchemy_core(new_records, new_hashes)
+            logger.info(f"Batch insert complete: {inserted}/{len(records)} records in batch")
             return inserted
         except Exception as e:
             logger.error(f"Bulk insert failed, falling back to row-by-row: {e}")
-            # Fallback to row-by-row
+            # Fallback to row-by-row insert
             inserted_count = 0
             for code_hash, record in zip(new_hashes, new_records, strict=True):
                 try:
@@ -334,6 +293,7 @@ class DatabaseClient:
                                 VALUES
                                 (:repo_name, :file_path, :commit_hash, :raw_code, :code_hash,
                                  :domain_tag, :algorithmic_intent, :memory_pattern, :hardware_utilization)
+                                ON CONFLICT (code_hash) DO NOTHING
                             """),
                             {
                                 "repo_name": record.repo_name,

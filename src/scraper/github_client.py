@@ -80,18 +80,19 @@ class GitHubClient:
         query: str,
         per_page: int = 30,
         page: int = 1,
-        sort: str | None = None,
+        sort: str = "stars",
         order: str = "desc",
     ) -> dict[str, Any]:
         """
         Search for code using GitHub's search API.
+        Results are sorted by stars by default to ensure high-quality kernels.
 
         Args:
             query: Search query string
             per_page: Results per page (max 100)
             page: Page number
-            sort: Sort field (indexed, stars, forks, etc.)
-            order: Sort order (asc or desc)
+            sort: Sort field (indexed, stars, forks, etc.) - default: stars
+            order: Sort order (asc or desc) - default: desc
 
         Returns:
             Search results with items and metadata
@@ -101,12 +102,11 @@ class GitHubClient:
             "q": query,
             "per_page": min(per_page, 100),
             "page": page,
+            "sort": sort,
             "order": order,
         }
-        if sort:
-            params["sort"] = sort
 
-        logger.info(f"Searching GitHub: {query} (page {page})")
+        logger.info(f"Searching GitHub: {query} (page {page}, sort={sort}, order={order})")
         return self._request("GET", url, params=params)
 
     def get_file_content(self, repo: str, path: str, ref: str | None = None) -> dict[str, Any]:
@@ -156,6 +156,7 @@ class GitHubClient:
         """
         Search for CUDA files with automatic pagination.
         Returns results and the final page reached for checkpointing.
+        Results are sorted by stars descending by default.
 
         Args:
             query: Additional search query terms
@@ -175,6 +176,8 @@ class GitHubClient:
                 query=f"{query} language:CUDA",
                 per_page=min(per_page, remaining),
                 page=page,
+                sort="stars",
+                order="desc",
             )
 
             items = results.get("items", [])
@@ -202,6 +205,7 @@ class GitHubClient:
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """
         Search for CUDA files with checkpoint support for resume after crash/timeout.
+        Results are sorted by stars descending for quality.
 
         Args:
             query: Additional search query terms
@@ -233,6 +237,8 @@ class GitHubClient:
                 query=f"{query} language:CUDA",
                 per_page=min(per_page, remaining),
                 page=page,
+                sort="stars",
+                order="desc",
             )
 
             items = results.get("items", [])
