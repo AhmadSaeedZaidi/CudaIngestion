@@ -23,6 +23,7 @@ jobs:
         with:
           python-version: '3.11'
           cache: 'poetry'
+          
       - name: Install dependencies
         run: poetry install
 
