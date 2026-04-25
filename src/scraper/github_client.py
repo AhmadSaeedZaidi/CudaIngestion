@@ -23,7 +23,7 @@ class GitHubClient:
     BASE_URL = "https://api.github.com"
 
     # Rate limit management
-    MIN_REQUEST_DELAY = 1.0  # Minimum seconds between requests
+    MIN_REQUEST_DELAY = 2.5  # Minimum seconds between requests
     MAX_REQUEST_DELAY = 10.0  # Maximum seconds between requests
 
     def __init__(self, token: str):
