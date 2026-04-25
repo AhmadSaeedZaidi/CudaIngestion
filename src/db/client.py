@@ -26,6 +26,10 @@ class KernelRecord:
     algorithmic_intent: str | None = None
     memory_pattern: str | None = None
     hardware_utilization: str | None = None
+    mathematical_formulation: str | None = None
+    thread_to_data_mapping: str | None = None
+    bottleneck_analysis: str | None = None
+    edge_case_vulnerabilities: str | None = None
 
 
 class DatabaseClient:
@@ -35,22 +39,13 @@ class DatabaseClient:
     Uses batch inserts for high-throughput operations.
     """
 
-    # Batch size for bulk inserts
     BATCH_SIZE = 100
 
     def __init__(self, connection_uri: str):
-        """
-        Initialize database client.
-
-        Args:
-            connection_uri: Neon PostgreSQL connection URI
-        """
         self.engine: Engine = create_engine(
             connection_uri,
-            poolclass=NullPool,  # Neon serverless works better with NullPool
-            connect_args={
-                "connect_timeout": 30,
-            },
+            poolclass=NullPool,
+            connect_args={"connect_timeout": 30},
         )
         logger.info("Database client initialized")
 
@@ -69,15 +64,16 @@ class DatabaseClient:
                     algorithmic_intent TEXT,
                     memory_pattern TEXT,
                     hardware_utilization TEXT,
+                    mathematical_formulation TEXT,
+                    thread_to_data_mapping TEXT,
+                    bottleneck_analysis TEXT,
+                    edge_case_vulnerabilities TEXT,
                     ingested_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """))
-            # Create indexes for common queries
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_code_hash ON kernels(code_hash)"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_domain_tag ON kernels(domain_tag)"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ingested_at ON kernels(ingested_at)"))
-
-            # Create ingestion state table for checkpointing
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS ingestion_state (
                     id SERIAL PRIMARY KEY,
@@ -87,32 +83,13 @@ class DatabaseClient:
                 )
             """))
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_state_key ON ingestion_state(state_key)"))
-
             conn.commit()
         logger.info("Database schema initialized")
 
     def compute_code_hash(self, code: str) -> str:
-        """
-        Compute SHA-256 hash of code for deduplication.
-
-        Args:
-            code: Raw CUDA code
-
-        Returns:
-            Hexadecimal hash string
-        """
         return hashlib.sha256(code.encode("utf-8")).hexdigest()
 
     def check_duplicate(self, code_hash: str) -> bool:
-        """
-        Check if a kernel with this hash already exists.
-
-        Args:
-            code_hash: SHA-256 hash of the code
-
-        Returns:
-            True if duplicate exists
-        """
         with self.engine.connect() as conn:
             result = conn.execute(
                 text("SELECT 1 FROM kernels WHERE code_hash = :hash LIMIT 1"),
@@ -121,18 +98,8 @@ class DatabaseClient:
             return result.fetchone() is not None
 
     def get_existing_hashes(self, code_hashes: list[str]) -> set[str]:
-        """
-        Check multiple hashes at once for efficiency.
-
-        Args:
-            code_hashes: List of code hashes to check
-
-        Returns:
-            Set of hashes that already exist
-        """
         if not code_hashes:
             return set()
-
         with self.engine.connect() as conn:
             placeholders = ", ".join([f":hash{i}" for i in range(len(code_hashes))])
             params = {f"hash{i}": h for i, h in enumerate(code_hashes)}
@@ -143,31 +110,21 @@ class DatabaseClient:
             return {row[0] for row in result.fetchall()}
 
     def insert_kernel(self, record: KernelRecord) -> bool:
-        """
-        Insert a kernel record into the database.
-
-        Args:
-            record: KernelRecord to insert
-
-        Returns:
-            True if inserted successfully, False if duplicate
-        """
         code_hash = self.compute_code_hash(record.raw_code)
-
-        # Check for duplicate before inserting
         if self.check_duplicate(code_hash):
             logger.debug(f"Duplicate kernel detected: {record.repo_name}/{record.file_path}")
             return False
-
         with self.engine.connect() as conn:
             conn.execute(
                 text("""
                     INSERT INTO kernels
                     (repo_name, file_path, commit_hash, raw_code, code_hash,
-                     domain_tag, algorithmic_intent, memory_pattern, hardware_utilization)
+                     domain_tag, algorithmic_intent, memory_pattern, hardware_utilization,
+                     mathematical_formulation, thread_to_data_mapping, bottleneck_analysis, edge_case_vulnerabilities)
                     VALUES
                     (:repo_name, :file_path, :commit_hash, :raw_code, :code_hash,
-                     :domain_tag, :algorithmic_intent, :memory_pattern, :hardware_utilization)
+                     :domain_tag, :algorithmic_intent, :memory_pattern, :hardware_utilization,
+                     :mathematical_formulation, :thread_to_data_mapping, :bottleneck_analysis, :edge_case_vulnerabilities)
                 """),
                 {
                     "repo_name": record.repo_name,
@@ -179,6 +136,10 @@ class DatabaseClient:
                     "algorithmic_intent": record.algorithmic_intent,
                     "memory_pattern": record.memory_pattern,
                     "hardware_utilization": record.hardware_utilization,
+                    "mathematical_formulation": record.mathematical_formulation,
+                    "thread_to_data_mapping": record.thread_to_data_mapping,
+                    "bottleneck_analysis": record.bottleneck_analysis,
+                    "edge_case_vulnerabilities": record.edge_case_vulnerabilities,
                 }
             )
             conn.commit()
@@ -186,19 +147,6 @@ class DatabaseClient:
             return True
 
     def _bulk_insert_sqlalchemy_core(self, records: list[KernelRecord], code_hashes: list[str]) -> int:
-        """
-        Use SQLAlchemy Core insert() for high-throughput batch inserts.
-        This works with any SQLAlchemy-supported database without requiring
-        psycopg2-specific cursor methods.
-
-        Args:
-            records: List of KernelRecord to insert
-            code_hashes: Pre-computed code hashes for records
-
-        Returns:
-            Number of records in the batch (actual inserts may be less due to deduplication)
-        """
-        # Build list of values for bulk insert
         values_list = []
         for i, record in enumerate(records):
             values_list.append({
@@ -211,143 +159,73 @@ class DatabaseClient:
                 "algorithmic_intent": record.algorithmic_intent,
                 "memory_pattern": record.memory_pattern,
                 "hardware_utilization": record.hardware_utilization,
+                "mathematical_formulation": record.mathematical_formulation,
+                "thread_to_data_mapping": record.thread_to_data_mapping,
+                "bottleneck_analysis": record.bottleneck_analysis,
+                "edge_case_vulnerabilities": record.edge_case_vulnerabilities,
             })
         with self.engine.connect() as conn:
             for i in range(0, len(values_list), self.BATCH_SIZE):
                 batch = values_list[i:i + self.BATCH_SIZE]
-
-                # Build parameterized insert
                 stmt = text("""
                     INSERT INTO kernels
                     (repo_name, file_path, commit_hash, raw_code, code_hash,
-                     domain_tag, algorithmic_intent, memory_pattern, hardware_utilization)
+                     domain_tag, algorithmic_intent, memory_pattern, hardware_utilization,
+                     mathematical_formulation, thread_to_data_mapping, bottleneck_analysis, edge_case_vulnerabilities)
                     VALUES
                     (:repo_name, :file_path, :commit_hash, :raw_code, :code_hash,
-                     :domain_tag, :algorithmic_intent, :memory_pattern, :hardware_utilization)
+                     :domain_tag, :algorithmic_intent, :memory_pattern, :hardware_utilization,
+                     :mathematical_formulation, :thread_to_data_mapping, :bottleneck_analysis, :edge_case_vulnerabilities)
                     ON CONFLICT (code_hash) DO NOTHING
                 """)
-
-                # Execute batch with multiple parameter sets
                 for values in batch:
                     conn.execute(stmt, values)
-
             conn.commit()
-
         return len(records)
 
     def insert_batch(self, records: list[KernelRecord]) -> int:
-        """
-        Insert multiple kernel records efficiently using batch inserts.
-        Uses SQLAlchemy Core for database-agnostic bulk operations.
-
-        Args:
-            records: List of KernelRecord to insert
-
-        Returns:
-            Number of records actually inserted (excluding duplicates)
-        """
         if not records:
             return 0
-
-        # Compute hashes and check for existing ones
         records_with_hashes = []
         for record in records:
             code_hash = self.compute_code_hash(record.raw_code)
             records_with_hashes.append((code_hash, record))
-
-        # Batch check for duplicates
         all_hashes = [r[0] for r in records_with_hashes]
         existing = self.get_existing_hashes(all_hashes)
-
-        # Filter out duplicates
         new_records = []
         new_hashes = []
-        for code_hash, record in records_with_hashes:
+        for _code_hash, record in records_with_hashes:
             if code_hash in existing:
-                logger.debug(f"Skipping duplicate: {record.repo_name}/{record.file_path}")
                 continue
             new_records.append(record)
             new_hashes.append(code_hash)
-
         if not new_records:
-            logger.info("All records were duplicates")
             return 0
-
-        # Use SQLAlchemy Core bulk insert
         try:
             inserted = self._bulk_insert_sqlalchemy_core(new_records, new_hashes)
-            logger.info(f"Batch insert complete: {inserted}/{len(records)} records in batch")
             return inserted
         except Exception as e:
-            logger.error(f"Bulk insert failed, falling back to row-by-row: {e}")
-            # Fallback to row-by-row insert
+            logger.error(f"Bulk insert failed: {e}")
             inserted_count = 0
-            for code_hash, record in zip(new_hashes, new_records, strict=True):
+            for _code_hash, record in zip(new_hashes, new_records, strict=True):
                 try:
-                    with self.engine.connect() as conn:
-                        conn.execute(
-                            text("""
-                                INSERT INTO kernels
-                                (repo_name, file_path, commit_hash, raw_code, code_hash,
-                                 domain_tag, algorithmic_intent, memory_pattern, hardware_utilization)
-                                VALUES
-                                (:repo_name, :file_path, :commit_hash, :raw_code, :code_hash,
-                                 :domain_tag, :algorithmic_intent, :memory_pattern, :hardware_utilization)
-                                ON CONFLICT (code_hash) DO NOTHING
-                            """),
-                            {
-                                "repo_name": record.repo_name,
-                                "file_path": record.file_path,
-                                "commit_hash": record.commit_hash,
-                                "raw_code": record.raw_code,
-                                "code_hash": code_hash,
-                                "domain_tag": record.domain_tag,
-                                "algorithmic_intent": record.algorithmic_intent,
-                                "memory_pattern": record.memory_pattern,
-                                "hardware_utilization": record.hardware_utilization,
-                            }
-                        )
-                        conn.commit()
+                    if self.insert_kernel(record):
                         inserted_count += 1
-                except Exception as e:
-                    logger.error(f"Failed to insert kernel {record.repo_name}/{record.file_path}: {e}")
+                except Exception:
+                    pass
             return inserted_count
 
     def get_stats(self) -> dict[str, Any]:
-        """
-        Get database statistics.
-
-        Returns:
-            Dictionary with kernel counts by domain and total
-        """
         with self.engine.connect() as conn:
             total = conn.execute(text("SELECT COUNT(*) FROM kernels")).scalar()
-
             by_domain = conn.execute(text("""
                 SELECT domain_tag, COUNT(*) as count
-                FROM kernels
-                WHERE domain_tag IS NOT NULL
-                GROUP BY domain_tag
-                ORDER BY count DESC
+                FROM kernels WHERE domain_tag IS NOT NULL
+                GROUP BY domain_tag ORDER BY count DESC
             """)).fetchall()
-
-            return {
-                "total_kernels": total,
-                "by_domain": dict(by_domain),
-            }
-
-    # ============ State Management for Checkpointing ============
+            return {"total_kernels": total, "by_domain": dict(by_domain)}
 
     def get_state(self, key: str) -> str | None:
-        """
-        Get ingestion state value by key.
-
-        Args:
-            key: State key (e.g., 'last_page', 'last_query')
-
-        Returns:
-            State value or None if not found
-        """
         with self.engine.connect() as conn:
             result = conn.execute(
                 text("SELECT state_value FROM ingestion_state WHERE state_key = :key"),
@@ -357,13 +235,6 @@ class DatabaseClient:
             return row[0] if row else None
 
     def set_state(self, key: str, value: str) -> None:
-        """
-        Set ingestion state value.
-
-        Args:
-            key: State key
-            value: State value
-        """
         with self.engine.connect() as conn:
             conn.execute(
                 text("""
@@ -375,34 +246,16 @@ class DatabaseClient:
                 {"key": key, "value": value}
             )
             conn.commit()
-        logger.debug(f"State saved: {key} = {value}")
 
     def delete_state(self, key: str) -> None:
-        """
-        Delete ingestion state by key.
-
-        Args:
-            key: State key to delete
-        """
         with self.engine.connect() as conn:
-            conn.execute(
-                text("DELETE FROM ingestion_state WHERE state_key = :key"),
-                {"key": key}
-            )
+            conn.execute(text("DELETE FROM ingestion_state WHERE state_key = :key"), {"key": key})
             conn.commit()
 
     def close(self) -> None:
-        """Close database connections."""
         self.engine.dispose()
-        logger.info("Database connections closed")
 
     @contextmanager
     def connection(self) -> Generator:
-        """
-        Context manager for database connections.
-
-        Yields:
-            Database connection
-        """
         with self.engine.connect() as conn:
             yield conn
