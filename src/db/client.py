@@ -275,30 +275,6 @@ class DatabaseClient:
 
     # ---- Search Progress Pagination Methods ----
 
-    def init_search_progress_schema(self) -> None:
-        """Initialize search_progress table if not exists."""
-        with self.engine.connect() as conn:
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS search_progress (
-                    id SERIAL PRIMARY KEY,
-                    query VARCHAR(500) NOT NULL,
-                    domain VARCHAR(100),
-                    current_page INTEGER DEFAULT 1,
-                    last_signature VARCHAR(500),
-                    last_result_count INTEGER DEFAULT 0,
-                    total_processed INTEGER DEFAULT 0,
-                    status VARCHAR(20) DEFAULT 'in_progress',
-                    rate_limit_reset TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(query)
-                )
-            """))
-            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_search_progress_status ON search_progress(status)"))
-            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_search_progress_domain ON search_progress(domain)"))
-            conn.commit()
-        logger.info("Search progress schema initialized")
-
     def get_search_progress(self, query: str) -> dict[str, Any] | None:
         """
         Get current progress for a search query.
@@ -347,6 +323,8 @@ class DatabaseClient:
         Creates new entry or updates existing one.
         """
         with self.engine.connect() as conn:
+            # Use NULL for rate_limit_reset when None to avoid PostgreSQL cast issues
+            reset_value = rate_limit_reset if rate_limit_reset else None
             conn.execute(
                 text("""
                     INSERT INTO search_progress
@@ -354,7 +332,7 @@ class DatabaseClient:
                      total_processed, status, rate_limit_reset, updated_at)
                     VALUES
                     (:query, :domain, :current_page, :last_signature, :last_result_count,
-                     :total_processed, :status, :rate_limit_reset::timestamp, CURRENT_TIMESTAMP)
+                     :total_processed, :status, :rate_limit_reset, CURRENT_TIMESTAMP)
                     ON CONFLICT (query)
                     DO UPDATE SET
                         domain = COALESCE(:domain, search_progress.domain),
@@ -363,7 +341,7 @@ class DatabaseClient:
                         last_result_count = :last_result_count,
                         total_processed = :total_processed,
                         status = :status,
-                        rate_limit_reset = :rate_limit_reset::timestamp,
+                        rate_limit_reset = :rate_limit_reset,
                         updated_at = CURRENT_TIMESTAMP
                 """),
                 {
@@ -374,7 +352,7 @@ class DatabaseClient:
                     "last_result_count": last_result_count,
                     "total_processed": total_processed,
                     "status": status,
-                    "rate_limit_reset": rate_limit_reset,
+                    "rate_limit_reset": reset_value,
                 }
             )
             conn.commit()
