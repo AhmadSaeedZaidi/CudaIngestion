@@ -391,63 +391,151 @@ class GitHubClient:
         query: str,
         max_results: int = 100,
         checkpoint_data: dict[str, Any] | None = None,
+        db_client=None,
+        domain: str | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """
-        Search for CUDA files with checkpoint support for resume after crash/timeout.
+        Search for CUDA files with database-backed pagination tracking.
         Uses per_page=100 to maximize results per API call.
-        Uses DIRECT search approach for better performance.
+        Persists pagination state to Neon DB for crash recovery and rate limit handling.
+
+        Args:
+            query: GitHub search query string
+            max_results: Maximum results to return (up to 1000 = 10 pages)
+            checkpoint_data: Legacy support - can be used if db_client not provided
+            db_client: Database client for pagination state tracking (recommended)
+            domain: Domain label for tracking (e.g., 'deep_learning')
+
+        Returns:
+            Tuple of (results_list, checkpoint_dict)
         """
         page = 1
         processed_count = 0
         seen_signatures = set()
+        last_signature = ""
 
-        if checkpoint_data:
+        # Check database for existing pagination state
+        if db_client:
+            progress = db_client.get_search_progress(query)
+            if progress:
+                if progress['status'] == 'failed':
+                    # Check if rate limit has reset
+                    from datetime import datetime
+                    reset_time = progress.get('rate_limit_reset')
+                    if reset_time and isinstance(reset_time, datetime):
+                        if reset_time > datetime.now():
+                            logger.info(f"Query {query} still rate limited until {reset_time}")
+                            return [], {"query": query, "status": "rate_limited"}
+                    # Rate limit expired, allow retry
+                    logger.info(f"Query {query} rate limit expired, retrying from page {progress['current_page']}")
+
+                if progress['status'] == 'completed':
+                    logger.info(f"Query {query} already completed, skipping")
+                    return [], {"query": query, "status": "completed"}
+
+                if progress['last_result_count'] == 100:
+                    # We stopped mid-search with more results available
+                    page = progress['current_page'] + 1
+                    processed_count = progress['total_processed']
+                    logger.info(f"Resuming query {query} from page {page} (processed: {processed_count})")
+                else:
+                    # No more results available (last_result_count < 100 means end)
+                    logger.info(f"Query {query} ended at page {progress['current_page']}")
+                    return [], {"query": query, "status": "completed"}
+
+        # Fallback to in-memory checkpoint if no db_client
+        elif checkpoint_data:
             if checkpoint_data.get("query") == query:
                 page = checkpoint_data.get("page", 1)
                 processed_count = checkpoint_data.get("processed_count", 0)
                 seen_signatures = set(checkpoint_data.get("seen_signatures", []))
-                logger.info(f"Resuming: page {page}, processed {processed_count}")
+                logger.info(f"Resuming (in-memory): page {page}, processed {processed_count}")
             else:
                 logger.info("Query changed, starting fresh")
 
         all_items = []
+        result_count = 0
 
         # Use direct code search - much faster than two-step repo->code
         while processed_count < max_results:
-            results = self.search_code(
-                query=query,
-                per_page=100,
-                page=page,
-            )
+            try:
+                results = self.search_code(
+                    query=query,
+                    per_page=100,
+                    page=page,
+                )
 
-            items = results.get("items", [])
-            if not items:
-                break
+                items = results.get("items", [])
+                result_count = len(items)
 
-            for item in items:
-                signature = (item.get("repository", {}).get("full_name"), item.get("path"))
-                if signature not in seen_signatures:
-                    seen_signatures.add(signature)
-                    all_items.append(item)
-                    processed_count += 1
+                if not items:
+                    # No more results for this query
+                    if db_client:
+                        db_client.mark_search_completed(query)
+                    break
 
-            if items:
-                logger.info(f"Fetched {len(items)} items (total processed: {processed_count})")
+                # Collect new items and signatures
+                for item in items:
+                    signature = (item.get("repository", {}).get("full_name"), item.get("path"))
+                    if signature not in seen_signatures:
+                        seen_signatures.add(signature)
+                        all_items.append(item)
+                        processed_count += 1
 
-            if len(items) == 100 and processed_count < max_results:
+                # Update last signature from last item in batch
+                if items:
+                    last_item = items[-1]
+                    last_signature = f"{last_item.get('repository', {}).get('full_name', '')}/{last_item.get('path', '')}"
+                    logger.info(f"Page {page}: fetched {len(items)} items (total: {processed_count}, last: {last_signature[:60]}...)")
+
+                # Update database progress after each page
+                if db_client:
+                    status = "in_progress"
+                    if result_count < 100:
+                        status = "completed"
+                    db_client.upsert_search_progress(
+                        query=query,
+                        domain=domain,
+                        current_page=page,
+                        last_signature=last_signature,
+                        last_result_count=result_count,
+                        total_processed=processed_count,
+                        status=status,
+                    )
+
+                # Check if we should continue pagination
+                if result_count < 100:
+                    # Less than full page = end of results
+                    if db_client and result_count > 0:
+                        db_client.mark_search_completed(query)
+                    break
+
+                if processed_count >= max_results:
+                    break
+
                 page += 1
                 delay = self.MIN_REQUEST_DELAY + random.uniform(0, self.REQUEST_DELAY_JITTER)
                 time.sleep(delay)
-            else:
-                break
 
-        all_items = self._sort_by_quality(all_items)
+            except Exception as e:
+                logger.error(f"Search failed at page {page}: {e}")
+                # Mark as failed with rate limit reset if applicable
+                if db_client and "rate limit" in str(e).lower():
+                    from datetime import datetime, timedelta
+                    reset_time = datetime.now() + timedelta(minutes=5)
+                    db_client.mark_search_failed(query, reset_time.isoformat())
+                raise
+
+        # Remove quality sorting to preserve query context diversity
+        # all_items = self._sort_by_quality(all_items)
 
         checkpoint = {
             "query": query,
             "page": page,
             "processed_count": processed_count,
+            "last_result_count": result_count,
             "seen_signatures": list(seen_signatures),
+            "status": "completed" if result_count < 100 else "has_more",
         }
 
         return all_items[:max_results], checkpoint

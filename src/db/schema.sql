@@ -41,3 +41,22 @@ CREATE TABLE IF NOT EXISTS ingestion_state (
 );
 
 CREATE INDEX IF NOT EXISTS idx_state_key ON ingestion_state(state_key);
+
+-- Tracks pagination state for GitHub search queries (cursor-based pagination)
+CREATE TABLE IF NOT EXISTS search_progress (
+    id SERIAL PRIMARY KEY,
+    query VARCHAR(500) NOT NULL,
+    domain VARCHAR(100),
+    current_page INTEGER DEFAULT 1,
+    last_signature VARCHAR(500),
+    last_result_count INTEGER DEFAULT 0,
+    total_processed INTEGER DEFAULT 0,
+    status VARCHAR(20) DEFAULT 'in_progress',
+    rate_limit_reset TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(query)
+);
+
+CREATE INDEX IF NOT EXISTS idx_search_progress_status ON search_progress(status);
+CREATE INDEX IF NOT EXISTS idx_search_progress_domain ON search_progress(domain);

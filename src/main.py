@@ -234,14 +234,31 @@ class IngestionPipeline:
             print(f"[{i+1}/{len(domain_queries)}] Searching: {query}", flush=True)
             logger.info(f"Searching with query: {query}")
 
-            # Use direct search for each query
+            # Use direct search for each query with DB-backed pagination
             try:
-                results, _ = self.github_client.search_cuda_files_with_checkpoint(
+                # Extract domain name from query (e.g., "deep learning extension:cu" -> "deep_learning")
+                domain = query.split()[0].lower().replace(" ", "_")
+
+                # Pass db_client for pagination tracking and resume capability
+                results, checkpoint = self.github_client.search_cuda_files_with_checkpoint(
                     query=query,
                     max_results=30,  # Get up to 30 per query for diversity
-                    checkpoint_data=None,  # Fresh start for each query
+                    db_client=self.db_client if not self.dry_run else None,
+                    domain=domain,
                 )
-                print(f"  -> Found {len(results)} results", flush=True)
+
+                status = checkpoint.get("status", "unknown")
+                page = checkpoint.get("page", 1)
+                processed = checkpoint.get("processed_count", 0)
+
+                if status == "completed":
+                    print(f"  -> Found {len(results)} results (query completed at page {page})", flush=True)
+                elif status == "rate_limited":
+                    print("  -> Rate limited, will retry later", flush=True)
+                    continue
+                else:
+                    print(f"  -> Found {len(results)} results (page {page}, processed: {processed})", flush=True)
+
             except Exception as e:
                 print(f"  -> Search failed: {type(e).__name__}: {e}", flush=True)
                 continue
