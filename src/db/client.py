@@ -194,7 +194,7 @@ class DatabaseClient:
         existing = self.get_existing_hashes(all_hashes)
         new_records = []
         new_hashes = []
-        for _code_hash, record in records_with_hashes:
+        for code_hash, record in records_with_hashes:
             if code_hash in existing:
                 continue
             new_records.append(record)
@@ -207,7 +207,7 @@ class DatabaseClient:
         except Exception as e:
             logger.error(f"Bulk insert failed: {e}")
             inserted_count = 0
-            for _code_hash, record in zip(new_hashes, new_records, strict=True):
+            for code_hash, record in zip(new_hashes, new_records, strict=True):
                 try:
                     if self.insert_kernel(record):
                         inserted_count += 1
