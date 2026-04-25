@@ -21,18 +21,19 @@ class CUDAFilter:
     Filters out host-only wrappers, dummy code, and low-quality submissions.
     """
 
-    # Required CUDA keywords for device code
+    # Required CUDA keywords for device code (relaxed)
     DEVICE_KEYWORDS = [
         "__global__",
         "__device__",
         "__shared__",
-        "__device__",
         "cudaMalloc",
         "cudaMemcpy",
         "threadIdx",
         "blockIdx",
         "blockDim",
         "gridDim",
+        "kernel",  # Generic kernel indicator
+        "cuda",  # CUDA library usage
     ]
 
     # Patterns indicating dummy/test code
@@ -47,13 +48,15 @@ class CUDAFilter:
         r"//\s*HACK",
     ]
 
-    # Patterns indicating actual kernel implementations
+    # Patterns indicating actual kernel implementations (relaxed)
     KERNEL_PATTERNS = [
-        r"__global__\s+void\s+\w+",  # Global kernel function
-        r"__device__\s+",  # Device function
-        r"cudaMalloc\s*\(",  # Memory allocation
-        r"cudaMemcpy\s*\(",  # Memory copy
-        r"<<<\s*\w+,\s*\w+",  # Kernel launch syntax
+        r"__global__",  # Global kernel function
+        r"__device__",  # Device function
+        r"cudaMalloc",  # Memory allocation
+        r"cudaMemcpy",  # Memory copy
+        r"<<<",  # Kernel launch syntax
+        r"threadIdx",  # Thread indexing
+        r"blockIdx",  # Block indexing
     ]
 
     # Minimum line count for a real kernel
@@ -62,7 +65,7 @@ class CUDAFilter:
     # Maximum ratio of comments to code (indicates commented-out code)
     MAX_COMMENT_RATIO = 0.7
 
-    def __init__(self, min_length: int = 50, max_length: int = 50000):
+    def __init__(self, min_length: int = 50, max_length: int = 100000):
         """
         Initialize filter with length constraints.
 
@@ -106,8 +109,8 @@ class CUDAFilter:
         # Count how many device keywords are present
         keyword_count = sum(1 for kw in self.DEVICE_KEYWORDS if kw in code)
 
-        # Require at least 2 device-related keywords
-        if keyword_count < 2:
+        # Require at least 1 device-related keyword (relaxed from 2)
+        if keyword_count < 1:
             return FilterResult(False, f"Insufficient device keywords: found {keyword_count}")
 
         return FilterResult(True)

@@ -230,18 +230,21 @@ class IngestionPipeline:
         seen_signatures = set()
         search_results = []
 
-        for query in domain_queries:
-            if len(search_results) >= max_kernels * 2:
-                break
-
+        for i, query in enumerate(domain_queries):
+            print(f"[{i+1}/{len(domain_queries)}] Searching: {query}", flush=True)
             logger.info(f"Searching with query: {query}")
 
             # Use direct search for each query
-            results, _ = self.github_client.search_cuda_files_with_checkpoint(
-                query=query,
-                max_results=max_kernels * 2,
-                checkpoint_data=None,  # Fresh start for each query
-            )
+            try:
+                results, _ = self.github_client.search_cuda_files_with_checkpoint(
+                    query=query,
+                    max_results=30,  # Get up to 30 per query for diversity
+                    checkpoint_data=None,  # Fresh start for each query
+                )
+                print(f"  -> Found {len(results)} results", flush=True)
+            except Exception as e:
+                print(f"  -> Search failed: {type(e).__name__}: {e}", flush=True)
+                continue
 
             for item in results:
                 sig = (item.get('repository', {}).get('full_name', ''), item.get('path', ''))
@@ -249,13 +252,11 @@ class IngestionPipeline:
                     seen_signatures.add(sig)
                     search_results.append(item)
 
-                    if len(search_results) >= max_kernels * 2:
-                        break
-
             # Delay between queries to avoid rate limits
-            if len(domain_queries) > 1:
+            if i < len(domain_queries) - 1:
                 time.sleep(0.5)
 
+        print(f"Total unique search results: {len(search_results)}", flush=True)
         logger.info(f"Found {len(search_results)} unique search results across {len(domain_queries)} domains")
 
         # Collect records to insert
@@ -265,14 +266,20 @@ class IngestionPipeline:
             if stats["fetched"] >= max_kernels:
                 break
 
+            repo = item.get('repository', {}).get('full_name', '')
+            path = item.get('path', '')
+            print(f"[{stats['fetched']+1}/{max_kernels}] Fetching: {repo}/{path}", flush=True)
+
             stats["fetched"] += 1
 
             # Fetch kernel content
             kernel_data = self.fetch_kernel(item)
             if not kernel_data:
+                print("  -> FAILED to fetch", flush=True)
                 continue
 
             repo, file_path, raw_code = kernel_data
+            print(f"  -> Fetched {len(raw_code)} chars", flush=True)
 
             # Process kernel (filter + annotate)
             record = self.process_kernel(repo, file_path, raw_code)

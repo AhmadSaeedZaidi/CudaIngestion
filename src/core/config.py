@@ -24,7 +24,7 @@ class Config:
 
     # Pipeline settings
     batch_size: int = int(os.getenv("BATCH_SIZE", "10"))
-    max_kernel_length: int = int(os.getenv("MAX_KERNEL_LENGTH", "50000"))
+    max_kernel_length: int = int(os.getenv("MAX_KERNEL_LENGTH", "100000"))
     min_kernel_length: int = int(os.getenv("MIN_KERNEL_LENGTH", "50"))
 
     # Dry run mode

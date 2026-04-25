@@ -67,10 +67,10 @@ class QueryBuilder:
         domain_terms = next(self._domain_cycle)
         primary_term = domain_terms[0]
 
-        # Build query with CUDA extension filter (valid for code search)
+        # Build query with CUDA extension filter (.cu or .cuh files)
         query_parts = [
             f"{primary_term}",
-            "extension:cu OR extension:cuh",
+            "extension:cu",
         ]
 
         return " ".join(query_parts)
@@ -91,7 +91,7 @@ class QueryBuilder:
         """
         query_parts = [
             domain,
-            "extension:cu OR extension:cuh",
+            "extension:cu",
         ]
 
         return " ".join(query_parts)
@@ -117,9 +117,13 @@ class QueryBuilder:
             num_queries: Number of queries to return
 
         Returns:
-            List of diverse query strings
+            List of diverse query strings (with CUDA extension filter)
         """
-        return [next(self._domain_cycle)[0] for _ in range(num_queries)]
+        queries = []
+        for _ in range(num_queries):
+            domain_term = next(self._domain_cycle)[0]
+            queries.append(self.build_query(domain_term))
+        return queries
 
     @staticmethod
     def get_repo_filter_query(min_stars: int = 50, fork_filter: bool = False) -> str:
