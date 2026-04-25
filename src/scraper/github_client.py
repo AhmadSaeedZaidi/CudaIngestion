@@ -25,7 +25,6 @@ class GitHubClient:
     # Rate limit management
     MIN_REQUEST_DELAY = 1.0  # Minimum seconds between requests
     MAX_REQUEST_DELAY = 10.0  # Maximum seconds between requests
-    LOW_RATE_LIMIT_THRESHOLD = 5  # X-RateLimit-Remaining threshold to trigger delay
 
     def __init__(self, token: str):
         """
@@ -43,6 +42,7 @@ class GitHubClient:
         })
         self._last_request_time = 0.0
         self._request_count = 0
+        self._rate_limit_waited_until = 0.0  # Track when we last waited for rate limit
 
     def _throttle(self) -> None:
         """
@@ -60,6 +60,25 @@ class GitHubClient:
         self._last_request_time = time.time()
         self._request_count += 1
 
+    def _check_rate_limit_before_request(self) -> bool:
+        """
+        Check if we should wait before making a request based on rate limit state.
+        Uses a cooldown mechanism to prevent repeated waiting.
+
+        Returns:
+            True if we should proceed, False if we need to wait (and already waited)
+        """
+        current_time = time.time()
+
+        # If we recently waited for rate limit (within last 5 minutes), skip the wait
+        if self._rate_limit_waited_until > current_time:
+            remaining_cooldown = self._rate_limit_waited_until - current_time
+            if remaining_cooldown > 0:
+                logger.debug(f"Rate limit cooldown active, {remaining_cooldown:.0f}s remaining")
+                return True  # Don't wait again, proceed with request
+
+        return True  # No recent wait, proceed normally
+
     @retry(
         retry=retry_if_exception_type((requests.exceptions.HTTPError, requests.exceptions.Timeout)),
         wait=wait_exponential(multiplier=1, min=5, max=120),
@@ -74,27 +93,25 @@ class GitHubClient:
 
         response = self.session.request(method, url, **kwargs)
 
-        # Check rate limit headers proactively
+        # Check rate limit headers
         remaining = int(response.headers.get("X-RateLimit-Remaining", 9999))
         reset_time = int(response.headers.get("X-RateLimit-Reset", 0))
-
-        if remaining < self.LOW_RATE_LIMIT_THRESHOLD:
-            wait_seconds = max(reset_time - time.time(), 0) + 2
-            logger.warning(f"Rate limit low ({remaining} remaining). Waiting {wait_seconds:.0f}s")
-            time.sleep(min(wait_seconds, 300))  # Cap at 5 minutes
+        current_time = time.time()
 
         # Handle 403 Forbidden - includes both auth issues and rate limits
         if response.status_code == 403:
             if remaining == 0:
                 # Primary rate limit hit
-                wait_seconds = max(reset_time - time.time(), 0) + 1
-                logger.warning(f"Rate limit exceeded. Waiting {wait_seconds:.0f}s")
+                wait_seconds = max(reset_time - current_time, 0) + 1
+                logger.warning(f"Rate limit exceeded (403). Waiting {wait_seconds:.0f}s")
+                self._rate_limit_waited_until = current_time + wait_seconds
                 time.sleep(min(wait_seconds, 300))
                 response.raise_for_status()
             elif "rate limit exceeded" in response.text.lower() or "abuse" in response.text.lower():
                 # Secondary rate limit (abuse detection)
                 retry_after = int(response.headers.get("Retry-After", 60))
                 logger.warning(f"Secondary rate limit (abuse). Waiting {retry_after}s")
+                self._rate_limit_waited_until = current_time + retry_after
                 time.sleep(retry_after)
                 response.raise_for_status()
             else:
@@ -106,6 +123,7 @@ class GitHubClient:
         if response.status_code == 429:
             retry_after = int(response.headers.get("Retry-After", 60))
             logger.warning(f"HTTP 429. Retrying after {retry_after}s")
+            self._rate_limit_waited_until = current_time + retry_after
             time.sleep(retry_after)
             response.raise_for_status()
 
@@ -185,24 +203,13 @@ class GitHubClient:
         """
         Score a kernel search result for quality prioritization.
         Higher scores = more likely to be valuable production code.
-
-        Scoring factors:
-        - Repository star count
-        - File path quality (kernel/ops vs test/example)
-        - File size estimate (larger files tend to be more complete)
-
-        Args:
-            item: Search result item from GitHub API
-
-        Returns:
-            Quality score (higher is better)
         """
         score = 0.0
 
         # Repository quality (biggest factor)
         repo = item.get("repository", {})
         stars = repo.get("stargazers_count", 0)
-        score += stars * 0.1  # Scale stars contribution
+        score += stars * 0.1
 
         # Path quality scoring
         path = item.get("path", "").lower()
@@ -220,23 +227,21 @@ class GitHubClient:
             if indicator in path:
                 score += 15
 
-        # Penalize very short paths (likely top-level test files)
+        # Penalize very short paths
         path_depth = path.count("/")
         if path_depth < 2:
             score -= 10
         elif path_depth >= 3:
             score += 5
 
-        # Bonus for .cu over .cuh (usually implementation vs header)
+        # Bonus for .cu over .cuh
         if filename.endswith(".cu") and not filename.endswith(".cuh"):
             score += 5
 
-        return max(score, 0.0)  # Ensure non-negative
+        return max(score, 0.0)
 
     def _sort_by_quality(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """
-        Sort search results by kernel quality score.
-        """
+        """Sort search results by kernel quality score."""
         scored = [(self.score_kernel(item), item) for item in items]
         scored.sort(key=lambda x: x[0], reverse=True)
         return [item for _, item in scored]
@@ -251,15 +256,14 @@ class GitHubClient:
         then searching for code within them. Results are sorted by quality.
         """
         all_items = []
-        seen_signatures = set()  # Deduplication by repo+path
+        seen_signatures = set()
 
-        # Step 1: Fetch top-starred CUDA repositories (fork:false to exclude forks)
+        # Step 1: Fetch top-starred CUDA repositories
         repos_data = self.search_repositories(
             "language:CUDA stars:>50 fork:false",
             per_page=50
         )
 
-        # Sort repos by star count (highest first for quality prioritization)
         repos_items = repos_data.get("items", [])
         repos_items.sort(key=lambda x: x.get("stargazers_count", 0), reverse=True)
         top_repos = [(item["full_name"], item.get("stargazers_count", 0)) for item in repos_items]
@@ -279,7 +283,6 @@ class GitHubClient:
             while len(all_items) < max_results:
                 remaining = max_results - len(all_items)
 
-                # Scope query to the specific high-quality repo
                 repo_query = f"{query} language:CUDA repo:{repo_name}"
 
                 results = self.search_code(
@@ -290,13 +293,11 @@ class GitHubClient:
 
                 items = results.get("items", [])
                 if not items:
-                    break  # No more results in this repo
+                    break
 
-                # Add repo star count to each item for scoring
                 for item in items:
                     item["repository"]["stargazers_count"] = repo_stars
 
-                # Deduplicate and add new items
                 for item in items:
                     signature = (item.get("repository", {}).get("full_name"), item.get("path"))
                     if signature not in seen_signatures:
@@ -306,18 +307,16 @@ class GitHubClient:
                 logger.info(f"Fetched {len(items)} items from {repo_name} (total: {len(all_items)})")
 
                 if len(items) < 30:
-                    break  # Reached the last page for this repo
+                    break
 
                 page += 1
-                # Delay between pages with jitter
                 delay = self.MIN_REQUEST_DELAY + random.uniform(0, 1)
                 time.sleep(delay)
 
-            # Longer delay between repos to avoid secondary rate limits
+            # Longer delay between repos
             delay = self.MIN_REQUEST_DELAY * 2 + random.uniform(0, 2)
             time.sleep(delay)
 
-        # Sort final results by quality score
         all_items = self._sort_by_quality(all_items)
         return all_items[:max_results]
 
@@ -329,15 +328,12 @@ class GitHubClient:
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """
         Search for CUDA files with checkpoint support for resume after crash/timeout.
-        Implements the two-step repo-then-code architecture with quality sorting.
         """
-        # Default state
         repo_index = 0
         page = 1
         processed_count = 0
         seen_signatures = set()
 
-        # Resume from checkpoint if valid
         if checkpoint_data:
             if checkpoint_data.get("query") == query:
                 repo_index = checkpoint_data.get("repo_index", 0)
@@ -350,7 +346,6 @@ class GitHubClient:
 
         all_items = []
 
-        # Step 1: Fetch stable list of top-starred repos sorted by stars
         repos_data = self.search_repositories(
             "language:CUDA stars:>50 fork:false",
             per_page=50
@@ -363,7 +358,6 @@ class GitHubClient:
         if not top_repos:
             return [], {"query": query, "repo_index": 0, "page": 1, "processed_count": 0, "seen_signatures": []}
 
-        # Step 2: Iterate and search
         while processed_count < max_results and repo_index < len(top_repos):
             repo_name, repo_stars = top_repos[repo_index]
             remaining = max_results - processed_count
@@ -378,11 +372,9 @@ class GitHubClient:
 
             items = results.get("items", [])
 
-            # Add repo star count to each item
             for item in items:
                 item["repository"]["stargazers_count"] = repo_stars
 
-            # Deduplicate and collect
             for item in items:
                 signature = (item.get("repository", {}).get("full_name"), item.get("path"))
                 if signature not in seen_signatures:
@@ -393,22 +385,18 @@ class GitHubClient:
             if items:
                 logger.info(f"Fetched {len(items)} items from {repo_name} (total processed: {processed_count})")
 
-            # Pagination and repo-switching logic
             if len(items) == 30 and processed_count < max_results:
                 page += 1
                 delay = self.MIN_REQUEST_DELAY + random.uniform(0, 1)
                 time.sleep(delay)
             else:
-                # Exhausted this repo, move to the next one
                 repo_index += 1
                 page = 1
                 delay = self.MIN_REQUEST_DELAY * 2 + random.uniform(0, 2)
                 time.sleep(delay)
 
-        # Sort by quality before returning
         all_items = self._sort_by_quality(all_items)
 
-        # Prepare checkpoint data
         checkpoint = {
             "query": query,
             "repo_index": repo_index,
