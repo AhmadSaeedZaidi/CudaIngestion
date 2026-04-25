@@ -147,7 +147,7 @@ class IngestionPipeline:
         else:
             logger.debug(f"Dry run: skipping MiniMax annotation for {repo}/{file_path}")
 
-        # Create kernel record
+        # Create kernel record with all annotation fields
         record = KernelRecord(
             repo_name=repo,
             file_path=file_path,
@@ -157,6 +157,10 @@ class IngestionPipeline:
             algorithmic_intent=annotation.algorithmic_intent if annotation else None,
             memory_pattern=annotation.memory_pattern if annotation else None,
             hardware_utilization=annotation.hardware_utilization if annotation else None,
+            mathematical_formulation=annotation.mathematical_formulation if annotation else None,
+            thread_to_data_mapping=annotation.thread_to_data_mapping if annotation else None,
+            bottleneck_analysis=annotation.bottleneck_analysis if annotation else None,
+            edge_case_vulnerabilities=annotation.edge_case_vulnerabilities if annotation else None,
         )
 
         return record
@@ -195,6 +199,7 @@ class IngestionPipeline:
     def run_batch(self, max_kernels: int = 10) -> dict[str, int]:
         """
         Run a batch of the ingestion pipeline.
+        Uses multi-query approach to get diverse kernels across different computational domains.
 
         Args:
             max_kernels: Maximum number of kernels to process
@@ -217,17 +222,41 @@ class IngestionPipeline:
         if checkpoint:
             logger.info(f"Resuming from checkpoint: {checkpoint}")
 
-        # Generate diverse search query
-        query = self.query_builder.get_next_query()
-        logger.info(f"Using search query: {query}")
+        # Get diverse queries from multiple domains
+        domain_queries = self.query_builder.get_diverse_batch(num_queries=5)
+        logger.info(f"Using {len(domain_queries)} diverse domain queries: {domain_queries}")
 
-        # Search for CUDA files with checkpoint support
-        search_results, new_checkpoint = self.github_client.search_cuda_files_with_checkpoint(
-            query=query,
-            max_results=max_kernels * 2,
-            checkpoint_data=checkpoint,
-        )
-        logger.info(f"Found {len(search_results)} search results")
+        # Collect unique search results across multiple domain queries
+        seen_signatures = set()
+        search_results = []
+
+        for query in domain_queries:
+            if len(search_results) >= max_kernels * 2:
+                break
+
+            logger.info(f"Searching with query: {query}")
+
+            # Use direct search for each query
+            results, _ = self.github_client.search_cuda_files_with_checkpoint(
+                query=query,
+                max_results=max_kernels * 2,
+                checkpoint_data=None,  # Fresh start for each query
+            )
+
+            for item in results:
+                sig = (item.get('repository', {}).get('full_name', ''), item.get('path', ''))
+                if sig not in seen_signatures:
+                    seen_signatures.add(sig)
+                    search_results.append(item)
+
+                    if len(search_results) >= max_kernels * 2:
+                        break
+
+            # Delay between queries to avoid rate limits
+            if len(domain_queries) > 1:
+                time.sleep(0.5)
+
+        logger.info(f"Found {len(search_results)} unique search results across {len(domain_queries)} domains")
 
         # Collect records to insert
         records_to_insert: list[KernelRecord] = []
@@ -237,10 +266,6 @@ class IngestionPipeline:
                 break
 
             stats["fetched"] += 1
-
-            # Save checkpoint periodically (every 10 items)
-            if stats["fetched"] % 10 == 0:
-                self._save_checkpoint(new_checkpoint)
 
             # Fetch kernel content
             kernel_data = self.fetch_kernel(item)
@@ -260,9 +285,6 @@ class IngestionPipeline:
 
             # Respectful delay between API calls
             time.sleep(1)
-
-        # Save checkpoint after processing
-        self._save_checkpoint(new_checkpoint)
 
         # Batch insert into database (skip in dry run)
         if records_to_insert:
