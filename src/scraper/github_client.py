@@ -5,12 +5,6 @@ import time
 from typing import Any
 
 import requests
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
 
 from src.core.logger import get_logger
 
@@ -23,7 +17,7 @@ class GitHubClient:
     BASE_URL = "https://api.github.com"
 
     # Rate limit management
-    MIN_REQUEST_DELAY = 2.5  # Minimum seconds between requests
+    MIN_REQUEST_DELAY = 1.0  # Minimum seconds between requests
     MAX_REQUEST_DELAY = 10.0  # Maximum seconds between requests
 
     def __init__(self, token: str):
@@ -42,7 +36,6 @@ class GitHubClient:
         })
         self._last_request_time = 0.0
         self._request_count = 0
-        self._rate_limit_waited_until = 0.0  # Track when we last waited for rate limit
 
     def _throttle(self) -> None:
         """
@@ -60,31 +53,6 @@ class GitHubClient:
         self._last_request_time = time.time()
         self._request_count += 1
 
-    def _check_rate_limit_before_request(self) -> bool:
-        """
-        Check if we should wait before making a request based on rate limit state.
-        Uses a cooldown mechanism to prevent repeated waiting.
-
-        Returns:
-            True if we should proceed, False if we need to wait (and already waited)
-        """
-        current_time = time.time()
-
-        # If we recently waited for rate limit (within last 5 minutes), skip the wait
-        if self._rate_limit_waited_until > current_time:
-            remaining_cooldown = self._rate_limit_waited_until - current_time
-            if remaining_cooldown > 0:
-                logger.debug(f"Rate limit cooldown active, {remaining_cooldown:.0f}s remaining")
-                return True  # Don't wait again, proceed with request
-
-        return True  # No recent wait, proceed normally
-
-    @retry(
-        retry=retry_if_exception_type((requests.exceptions.HTTPError, requests.exceptions.Timeout)),
-        wait=wait_exponential(multiplier=1, min=5, max=120),
-        stop=stop_after_attempt(5),
-        reraise=True,
-    )
     def _request(self, method: str, url: str, **kwargs) -> dict[str, Any]:
         """
         Make an HTTP request with retry logic for rate limits.
@@ -100,37 +68,47 @@ class GitHubClient:
 
         # Handle 403 Forbidden - includes both auth issues and rate limits
         if response.status_code == 403:
-            if remaining == 0:
-                # Primary rate limit hit
-                wait_seconds = max(reset_time - current_time, 0) + 1
-                logger.warning(f"Rate limit exceeded (403). Waiting {wait_seconds:.0f}s")
-                self._rate_limit_waited_until = current_time + wait_seconds
+            retry_after = int(response.headers.get("Retry-After", 0))
+
+            if remaining == 0 or "rate limit exceeded" in response.text.lower() or "abuse" in response.text.lower():
+                # Use Retry-After header if available, otherwise calculate from reset_time
+                if retry_after > 0:
+                    wait_seconds = retry_after
+                else:
+                    wait_seconds = max(reset_time - current_time, 0) + 1
+
+                logger.warning(f"Rate limit hit. Waiting {wait_seconds}s (Retry-After: {retry_after}, reset in {max(reset_time - current_time, 0):.0f}s)")
                 time.sleep(min(wait_seconds, 300))
-                response.raise_for_status()
-            elif "rate limit exceeded" in response.text.lower() or "abuse" in response.text.lower():
-                # Secondary rate limit (abuse detection)
-                retry_after = int(response.headers.get("Retry-After", 60))
-                logger.warning(f"Secondary rate limit (abuse). Waiting {retry_after}s")
-                self._rate_limit_waited_until = current_time + retry_after
-                time.sleep(retry_after)
-                response.raise_for_status()
+
+                # Make a fresh request after waiting - don't call raise_for_status()
+                # as it would trigger retry and cause infinite loop
+                logger.info("Making fresh request after rate limit wait")
+                response = self.session.request(method, url, **kwargs)
+
+                # Update remaining from new response
+                remaining = int(response.headers.get("X-RateLimit-Remaining", 9999))
+                logger.info(f"After wait - status: {response.status_code}, remaining: {remaining}")
             else:
                 # Other 403 - likely auth issue
-                logger.error(f"403 Forbidden - check token permissions: {response.text[:200]}")
+                logger.error(f"403 Forbidden (auth issue): {response.text[:200]}")
                 response.raise_for_status()
 
         # Handle 429 Too Many Requests
         if response.status_code == 429:
             retry_after = int(response.headers.get("Retry-After", 60))
-            logger.warning(f"HTTP 429. Retrying after {retry_after}s")
-            self._rate_limit_waited_until = current_time + retry_after
-            time.sleep(retry_after)
-            response.raise_for_status()
+            wait_seconds = retry_after if retry_after > 0 else 60
+            logger.warning(f"HTTP 429. Waiting {wait_seconds}s")
+            time.sleep(wait_seconds)
+
+            # Make fresh request after waiting
+            response = self.session.request(method, url, **kwargs)
+            remaining = int(response.headers.get("X-RateLimit-Remaining", 9999))
+            logger.info(f"After 429 wait - status: {response.status_code}, remaining: {remaining}")
 
         # Handle 502/503 Server Errors
         if response.status_code in (502, 503):
             retry_after = int(response.headers.get("Retry-After", 60))
-            logger.warning(f"HTTP {response.status_code}. Retrying after {retry_after}s")
+            logger.warning(f"HTTP {response.status_code}. Waiting {retry_after}s")
             time.sleep(retry_after)
             response.raise_for_status()
 
@@ -206,35 +184,29 @@ class GitHubClient:
         """
         score = 0.0
 
-        # Repository quality (biggest factor)
         repo = item.get("repository", {})
         stars = repo.get("stargazers_count", 0)
         score += stars * 0.1
 
-        # Path quality scoring
         path = item.get("path", "").lower()
         filename = path.split("/")[-1]
 
-        # Penalize test/homework patterns
         test_indicators = ["test", "example", "demo", "tutorial", "homework", "assignment", "practice"]
         for indicator in test_indicators:
             if indicator in path:
                 score -= 20
 
-        # Bonus for likely production kernel paths
         kernel_indicators = ["kernel", "/ops/", "/math/", "/cuda/", "/compute/", "/core/"]
         for indicator in kernel_indicators:
             if indicator in path:
                 score += 15
 
-        # Penalize very short paths
         path_depth = path.count("/")
         if path_depth < 2:
             score -= 10
         elif path_depth >= 3:
             score += 5
 
-        # Bonus for .cu over .cuh
         if filename.endswith(".cu") and not filename.endswith(".cuh"):
             score += 5
 
@@ -258,7 +230,6 @@ class GitHubClient:
         all_items = []
         seen_signatures = set()
 
-        # Step 1: Fetch top-starred CUDA repositories
         repos_data = self.search_repositories(
             "language:CUDA stars:>50 fork:false",
             per_page=50
@@ -274,7 +245,6 @@ class GitHubClient:
 
         logger.info(f"Found {len(top_repos)} high-quality CUDA repos. Processing by star count.")
 
-        # Step 2: Search code within those specific repositories
         for repo_name, repo_stars in top_repos:
             if len(all_items) >= max_results:
                 break
@@ -313,7 +283,6 @@ class GitHubClient:
                 delay = self.MIN_REQUEST_DELAY + random.uniform(0, 1)
                 time.sleep(delay)
 
-            # Longer delay between repos
             delay = self.MIN_REQUEST_DELAY * 2 + random.uniform(0, 2)
             time.sleep(delay)
 
