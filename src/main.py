@@ -130,12 +130,15 @@ class IngestionPipeline:
             logger.debug(f"Filtered out {repo}/{file_path}: {reason}")
             return None
 
-        # Get commit hash for this file
+        # Get commit hash for this file (with delay to avoid rate limits)
+        commit_hash = "unknown"
         try:
+            # Add small delay before commit API call to spread requests
+            time.sleep(0.5)
             commits = self.github_client.get_commits(repo, per_page=1)
             commit_hash = commits[0].get("sha", "unknown") if commits else "unknown"
         except Exception:
-            commit_hash = "unknown"
+            pass  # Keep "unknown" if commit fetch fails
 
         # Annotate with MiniMax M2.7 (skip in dry run)
         annotation = None
