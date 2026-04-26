@@ -12,13 +12,13 @@ logger = get_logger(__name__)
 
 
 class GitHubClient:
-    """GitHub API client with robust rate limiting handling and checkpoint support."""
+    """GitHub API client with robust rate limiting handling, caching, and deduplication."""
 
     BASE_URL = "https://api.github.com"
 
-    # Rate limit management - reduced delays for better performance
-    MIN_REQUEST_DELAY = 1.0  # 1 second between requests
-    REQUEST_DELAY_JITTER = 0.5  # Add up to 0.5s random jitter
+    # Rate limit management - conservative delays to avoid hitting limits
+    MIN_REQUEST_DELAY = 2.0  # 2 seconds between requests (increased from 1.0)
+    REQUEST_DELAY_JITTER = 1.0  # Add up to 1s random jitter (increased from 0.5)
 
     def __init__(self, token: str):
         """
@@ -40,6 +40,12 @@ class GitHubClient:
         # Track rate limit state to prevent repeated hits
         self._rate_limit_reset_at = 0.0  # Unix timestamp when rate limit resets
         self._last_remaining = 9999  # Last known remaining requests
+
+        # In-memory cache for file contents to avoid redundant API calls
+        self._file_cache: dict[str, str] = {}
+
+        # In-memory cache for commit hashes
+        self._commit_cache: dict[str, str] = {}
 
     def _wait_if_rate_limited(self) -> None:
         """
@@ -434,10 +440,20 @@ class GitHubClient:
                     return [], {"query": query, "status": "completed"}
 
                 if progress['last_result_count'] == 100:
-                    # We stopped mid-search with more results available
-                    page = progress['current_page'] + 1
-                    processed_count = progress['total_processed']
-                    logger.info(f"Resuming query {query} from page {page} (processed: {processed_count})")
+                    # Check if we've already processed more than max_results
+                    # If so, we need to start fresh for this run to return results
+                    if progress['total_processed'] >= max_results:
+                        logger.info(f"Query {query} already processed {progress['total_processed']} >= max_results {max_results}, starting fresh")
+                        # Mark current as completed and start new
+                        db_client.mark_search_completed(query)
+                        # Also delete to allow fresh start
+                        db_client.delete_completed_searches()
+                        # Continue with fresh state below
+                    else:
+                        # We stopped mid-search with more results available
+                        page = progress['current_page'] + 1
+                        processed_count = progress['total_processed']
+                        logger.info(f"Resuming query {query} from page {page} (processed: {processed_count})")
                 else:
                     # No more results available (last_result_count < 100 means end)
                     logger.info(f"Query {query} ended at page {progress['current_page']}")
@@ -489,14 +505,17 @@ class GitHubClient:
                     logger.info(f"Page {page}: fetched {len(items)} items (total: {processed_count}, last: {last_signature[:60]}...)")
 
                 # Update database progress after each page
+                # Note: we save 'page - 1' as current_page because page has been incremented
+                # after processing, so the last successfully processed page is page - 1
                 if db_client:
+                    last_page_processed = max(1, page - 1)
                     status = "in_progress"
                     if result_count < 100:
                         status = "completed"
                     db_client.upsert_search_progress(
                         query=query,
                         domain=domain,
-                        current_page=page,
+                        current_page=last_page_processed,
                         last_signature=last_signature,
                         last_result_count=result_count,
                         total_processed=processed_count,

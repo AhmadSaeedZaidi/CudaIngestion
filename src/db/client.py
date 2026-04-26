@@ -424,6 +424,21 @@ class DatabaseClient:
                 logger.info(f"Cleaned up {deleted} completed search entries")
             return deleted
 
+    def delete_completed_searches(self) -> int:
+        """Delete ALL completed search entries to allow fresh runs to re-search queries."""
+        with self.engine.connect() as conn:
+            result = conn.execute(
+                text("""
+                    DELETE FROM search_progress
+                    WHERE status = 'completed'
+                    RETURNING query
+                """)
+            )
+            deleted = len(result.fetchall())
+            conn.commit()
+            logger.info(f"Deleted {deleted} completed search entries for fresh run")
+            return deleted
+
     def close(self) -> None:
         self.engine.dispose()
 

@@ -143,9 +143,12 @@ class IngestionPipeline:
         # Annotate with MiniMax M2.7 (skip in dry run)
         annotation = None
         if not self.dry_run:
+            print("  -> Calling MiniMax API for annotation...", flush=True)
             annotation = self.annotator.annotate(raw_code)
+            if annotation:
+                print(f"  -> Annotated: domain={annotation.domain_tag}", flush=True)
         else:
-            logger.debug(f"Dry run: skipping MiniMax annotation for {repo}/{file_path}")
+            logger.debug("Dry run: skipping MiniMax annotation for %s/%s", repo, file_path)
 
         # Create kernel record with all annotation fields
         record = KernelRecord(
@@ -221,6 +224,12 @@ class IngestionPipeline:
         checkpoint = self._get_checkpoint()
         if checkpoint:
             logger.info(f"Resuming from checkpoint: {checkpoint}")
+
+        # Clear completed searches to allow fresh runs to re-search queries
+        if not self.dry_run:
+            deleted = self.db_client.delete_completed_searches()
+            if deleted > 0:
+                logger.info(f"Cleared {deleted} completed search entries for fresh run")
 
         # Get diverse queries from multiple domains
         domain_queries = self.query_builder.get_diverse_batch(num_queries=5)
