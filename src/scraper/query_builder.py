@@ -126,14 +126,14 @@ class QueryBuilder:
         return queries
 
     @staticmethod
-    def get_repo_filter_query(min_stars: int = 50, fork_filter: bool = False) -> str:
+    def get_repo_filter_query(min_stars: int = 100, fork_filter: bool = True) -> str:
         """
         Get the repository search query for quality filtering.
         This is used with /search/repositories to find top CUDA repos.
 
         Args:
-            min_stars: Minimum star count (default: 50)
-            fork_filter: Whether to filter out forks (default: False)
+            min_stars: Minimum star count (default: 100)
+            fork_filter: Whether to filter out forks (default: True)
 
         Returns:
             Repository search query string
@@ -146,3 +146,18 @@ class QueryBuilder:
             query_parts.append("fork:false")
 
         return " ".join(query_parts)
+
+    @staticmethod
+    def repo_discovery_queries() -> list[str]:
+        """
+        Rotating /search/repositories queries after each full API window (~1000 repos).
+        Different star floors and pushed windows surface overlapping but not identical sets.
+        """
+        q = QueryBuilder.get_repo_filter_query
+        return [
+            q(100, True),
+            q(50, True),
+            f"{q(100, True)} pushed:>2023-06-01",
+            q(150, True),
+            f"{q(80, True)} pushed:>2024-01-01",
+        ]

@@ -26,9 +26,16 @@ class Config:
     batch_size: int = int(os.getenv("BATCH_SIZE", "10"))
     max_kernel_length: int = int(os.getenv("MAX_KERNEL_LENGTH", "100000"))
     min_kernel_length: int = int(os.getenv("MIN_KERNEL_LENGTH", "50"))
+    # Repo discovery page size (1–100). Lower for faster local runs (e.g. REPOS_PER_RUN=8).
+    repos_per_run: int = int(os.getenv("REPOS_PER_RUN", "50"))
 
     # Dry run mode
     dry_run: bool = os.getenv("DRY_RUN", "false").lower() in ("true", "1", "yes")
+
+    # Reset persisted GitHub repo pagination (page + query variant) to defaults on next run
+    reset_github_repo_discovery: bool = os.getenv(
+        "RESET_GITHUB_REPO_DISCOVERY", "false"
+    ).lower() in ("true", "1", "yes")
 
     def validate(self) -> None:
         """Validate that required configuration is present."""
@@ -43,5 +50,6 @@ class Config:
 def get_config() -> Config:
     """Get a validated configuration instance."""
     config = Config()
+    config.repos_per_run = max(1, min(100, config.repos_per_run))
     config.validate()
     return config

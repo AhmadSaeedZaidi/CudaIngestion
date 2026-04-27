@@ -1,5 +1,6 @@
 """GitHub API client with rate limiting, pagination, and checkpointing support."""
 
+import os
 import random
 import time
 from typing import Any
@@ -47,6 +48,14 @@ class GitHubClient:
         # In-memory cache for commit hashes
         self._commit_cache: dict[str, str] = {}
 
+        self._min_request_delay = self.MIN_REQUEST_DELAY
+        env_delay = os.getenv("GITHUB_REQUEST_DELAY_SECONDS", "").strip()
+        if env_delay:
+            try:
+                self._min_request_delay = max(0.0, float(env_delay))
+            except ValueError:
+                logger.warning("Invalid GITHUB_REQUEST_DELAY_SECONDS; using default throttle")
+
     def _wait_if_rate_limited(self) -> None:
         """
         Proactively wait if we're in a rate limit window.
@@ -64,7 +73,7 @@ class GitHubClient:
         # Only add extra delay when we're critically low on requests (remaining < 3)
         if self._last_remaining < 3 and self._last_remaining > 0:
             # We're critically low on remaining requests, add extra delay
-            delay = self.MIN_REQUEST_DELAY + random.uniform(0.5, 1.0)
+            delay = self._min_request_delay + random.uniform(0.5, 1.0)
             logger.info(f"Critically low remaining ({self._last_remaining}), adding extra delay of {delay:.1f}s")
             time.sleep(delay)
 
@@ -78,8 +87,8 @@ class GitHubClient:
         current_time = time.time()
         elapsed = current_time - self._last_request_time
 
-        if elapsed < self.MIN_REQUEST_DELAY:
-            delay = self.MIN_REQUEST_DELAY + random.uniform(0, self.REQUEST_DELAY_JITTER)
+        if elapsed < self._min_request_delay:
+            delay = self._min_request_delay + random.uniform(0, self.REQUEST_DELAY_JITTER)
             logger.debug(f"Throttling request by {delay:.2f}s")
             time.sleep(delay)
 
@@ -344,11 +353,11 @@ class GitHubClient:
                     break
 
                 page += 1
-                delay = self.MIN_REQUEST_DELAY + random.uniform(0, self.REQUEST_DELAY_JITTER)
+                delay = self._min_request_delay + random.uniform(0, self.REQUEST_DELAY_JITTER)
                 time.sleep(delay)
 
             # Longer delay between repos
-            delay = self.MIN_REQUEST_DELAY * 2 + random.uniform(0, 2)
+            delay = self._min_request_delay * 2 + random.uniform(0, 2)
             time.sleep(delay)
 
         all_items = self._sort_by_quality(all_items)
@@ -386,11 +395,80 @@ class GitHubClient:
                 break
 
             page += 1
-            delay = self.MIN_REQUEST_DELAY + random.uniform(0, self.REQUEST_DELAY_JITTER)
+            delay = self._min_request_delay + random.uniform(0, self.REQUEST_DELAY_JITTER)
             time.sleep(delay)
 
         all_items = self._sort_by_quality(all_items)
         return all_items[:max_results]
+
+    def collect_cuda_hits_from_repos(
+        self,
+        repos: list[dict[str, Any]],
+        domain_queries: list[str],
+        *,
+        code_hits_per_repo: int = 30,
+        max_total_candidates: int = 400,
+    ) -> list[dict[str, Any]]:
+        """
+        Run /search/code scoped to each repository for domain diversity.
+        Results are deduplicated, scored, and truncated for downstream fetch limits.
+
+        Args:
+            repos: Items from /search/repositories (need full_name, stargazers_count).
+            domain_queries: Code-search queries (must be valid for /search/code, e.g. contain extension:cu).
+            code_hits_per_repo: per_page for each repo-scoped code search (max 100).
+            max_total_candidates: cap after scoring to avoid huge fan-out before file fetches.
+        """
+        if not repos or not domain_queries:
+            return []
+
+        seen: set[tuple[str, str]] = set()
+        collected: list[dict[str, Any]] = []
+
+        for i, repo in enumerate(repos):
+            full_name = repo.get("full_name") or ""
+            stars = int(repo.get("stargazers_count") or 0)
+            if not full_name:
+                continue
+
+            domain_q = domain_queries[i % len(domain_queries)].strip()
+            code_query = f"{domain_q} repo:{full_name}"
+
+            try:
+                results = self.search_code(
+                    query=code_query,
+                    per_page=min(code_hits_per_repo, 100),
+                    page=1,
+                )
+                items = list(results.get("items") or [])
+                if not items:
+                    fallback_q = f"extension:cu repo:{full_name}"
+                    results = self.search_code(
+                        query=fallback_q,
+                        per_page=min(code_hits_per_repo, 100),
+                        page=1,
+                    )
+                    items = list(results.get("items") or [])
+            except Exception as e:
+                logger.warning(f"Code search failed for {full_name}: {e}")
+                continue
+            for item in items:
+                repo_meta = item.get("repository") or {}
+                rname = repo_meta.get("full_name", "")
+                path = item.get("path", "")
+                sig = (rname, path)
+                if not rname or not path or sig in seen:
+                    continue
+                seen.add(sig)
+                if "repository" in item and isinstance(item["repository"], dict):
+                    item["repository"]["stargazers_count"] = stars
+                collected.append(item)
+
+            delay = self._min_request_delay + random.uniform(0, self.REQUEST_DELAY_JITTER)
+            time.sleep(delay)
+
+        collected = self._sort_by_quality(collected)
+        return collected[:max_total_candidates]
 
     def search_cuda_files_with_checkpoint(
         self,
@@ -416,7 +494,6 @@ class GitHubClient:
             Tuple of (results_list, checkpoint_dict)
         """
         page = 1
-        processed_count = 0
         seen_signatures = set()
         last_signature = ""
 
@@ -440,22 +517,11 @@ class GitHubClient:
                     return [], {"query": query, "status": "completed"}
 
                 if progress['last_result_count'] == 100:
-                    # Check if we've already processed more than max_results
-                    # If so, we need to start fresh for this run to return results
-                    if progress['total_processed'] >= max_results:
-                        logger.info(f"Query {query} already processed {progress['total_processed']} >= max_results {max_results}, starting fresh")
-                        # Mark current as completed and start new
-                        db_client.mark_search_completed(query)
-                        # Also delete to allow fresh start
-                        db_client.delete_completed_searches()
-                        # Continue with fresh state below
-                    else:
-                        # We stopped mid-search with more results available
-                        page = progress['current_page'] + 1
-                        processed_count = progress['total_processed']
-                        logger.info(f"Resuming query {query} from page {page} (processed: {processed_count})")
+                    # More pages may exist; continue from next GitHub page.
+                    page = progress['current_page'] + 1
+                    logger.info(f"Resuming query {query} from GitHub page {page}")
                 else:
-                    # No more results available (last_result_count < 100 means end)
+                    # Exhausted GitHub results for this query (partial last page).
                     logger.info(f"Query {query} ended at page {progress['current_page']}")
                     return [], {"query": query, "status": "completed"}
 
@@ -463,9 +529,8 @@ class GitHubClient:
         elif checkpoint_data:
             if checkpoint_data.get("query") == query:
                 page = checkpoint_data.get("page", 1)
-                processed_count = checkpoint_data.get("processed_count", 0)
                 seen_signatures = set(checkpoint_data.get("seen_signatures", []))
-                logger.info(f"Resuming (in-memory): page {page}, processed {processed_count}")
+                logger.info(f"Resuming (in-memory): page {page}, seen {len(seen_signatures)}")
             else:
                 logger.info("Query changed, starting fresh")
 
@@ -473,7 +538,7 @@ class GitHubClient:
         result_count = 0
 
         # Use direct code search - much faster than two-step repo->code
-        while processed_count < max_results:
+        while len(all_items) < max_results:
             try:
                 results = self.search_code(
                     query=query,
@@ -490,35 +555,34 @@ class GitHubClient:
                         db_client.mark_search_completed(query)
                     break
 
-                # Collect new items and signatures
+                # Collect new items and signatures (stop once we have enough for this run)
                 for item in items:
+                    if len(all_items) >= max_results:
+                        break
                     signature = (item.get("repository", {}).get("full_name"), item.get("path"))
                     if signature not in seen_signatures:
                         seen_signatures.add(signature)
                         all_items.append(item)
-                        processed_count += 1
 
                 # Update last signature from last item in batch
                 if items:
                     last_item = items[-1]
                     last_signature = f"{last_item.get('repository', {}).get('full_name', '')}/{last_item.get('path', '')}"
-                    logger.info(f"Page {page}: fetched {len(items)} items (total: {processed_count}, last: {last_signature[:60]}...)")
+                    logger.info(
+                        f"Page {page}: fetched {len(items)} items (collected: {len(all_items)}, last: {last_signature[:60]}...)"
+                    )
 
-                # Update database progress after each page
-                # Note: we save 'page - 1' as current_page because page has been incremented
-                # after processing, so the last successfully processed page is page - 1
                 if db_client:
-                    last_page_processed = max(1, page - 1)
                     status = "in_progress"
                     if result_count < 100:
                         status = "completed"
                     db_client.upsert_search_progress(
                         query=query,
                         domain=domain,
-                        current_page=last_page_processed,
+                        current_page=page,
                         last_signature=last_signature,
                         last_result_count=result_count,
-                        total_processed=processed_count,
+                        total_processed=len(all_items),
                         status=status,
                     )
 
@@ -529,11 +593,11 @@ class GitHubClient:
                         db_client.mark_search_completed(query)
                     break
 
-                if processed_count >= max_results:
+                if len(all_items) >= max_results:
                     break
 
                 page += 1
-                delay = self.MIN_REQUEST_DELAY + random.uniform(0, self.REQUEST_DELAY_JITTER)
+                delay = self._min_request_delay + random.uniform(0, self.REQUEST_DELAY_JITTER)
                 time.sleep(delay)
 
             except Exception as e:
@@ -551,7 +615,7 @@ class GitHubClient:
         checkpoint = {
             "query": query,
             "page": page,
-            "processed_count": processed_count,
+            "processed_count": len(all_items),
             "last_result_count": result_count,
             "seen_signatures": list(seen_signatures),
             "status": "completed" if result_count < 100 else "has_more",

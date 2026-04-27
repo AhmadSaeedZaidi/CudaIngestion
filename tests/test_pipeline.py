@@ -103,14 +103,25 @@ class TestQueryBuilder:
         """Test that repo filter query is correctly generated."""
         from src.scraper.query_builder import QueryBuilder
 
-        # Test default
+        # Test default (quality bar: stars + non-forks)
         repo_query = QueryBuilder.get_repo_filter_query()
         assert "language:CUDA" in repo_query
-        assert "stars:>50" in repo_query
+        assert "stars:>100" in repo_query
+        assert "fork:false" in repo_query
 
-        # Test with fork filter
-        repo_query_with_fork = QueryBuilder.get_repo_filter_query(fork_filter=True)
-        assert "fork:false" in repo_query_with_fork
+        # Explicit lower star floor without fork filter
+        repo_query_loose = QueryBuilder.get_repo_filter_query(min_stars=50, fork_filter=False)
+        assert "stars:>50" in repo_query_loose
+        assert "fork:false" not in repo_query_loose
+
+    def test_repo_discovery_queries_rotate(self):
+        """Rotating repo queries should be distinct strings for long-running discovery."""
+        from src.scraper.query_builder import QueryBuilder
+
+        variants = QueryBuilder.repo_discovery_queries()
+        assert len(variants) >= 3
+        assert len(set(variants)) == len(variants)
+        assert all("language:CUDA" in v for v in variants)
 
 
 class TestPipelineDryRun:
@@ -128,6 +139,8 @@ class TestPipelineDryRun:
         config.max_kernel_length = 50000
         config.min_kernel_length = 50
         config.dry_run = True
+        config.repos_per_run = 50
+        config.reset_github_repo_discovery = False
         return config
 
     def test_pipeline_initializes_in_dry_run(self, mock_config):
@@ -202,6 +215,8 @@ class TestPipelineIntegration:
             max_kernel_length=50000,
             min_kernel_length=50,
             dry_run=True,
+            repos_per_run=50,
+            reset_github_repo_discovery=False,
         )
 
         # Mock GitHub response for code search
@@ -235,24 +250,28 @@ class TestPipelineIntegration:
                     return_value=mock_code_search_result,
                 ):
                     with patch(
-                        "src.scraper.github_client.GitHubClient.get_file_content",
-                        return_value=mock_file_content,
+                        "src.scraper.github_client.GitHubClient.collect_cuda_hits_from_repos",
+                        return_value=mock_code_search_result["items"],
                     ):
                         with patch(
-                            "src.scraper.github_client.GitHubClient.get_commits",
-                            return_value=[{"sha": "abc123"}],
+                            "src.scraper.github_client.GitHubClient.get_file_content",
+                            return_value=mock_file_content,
                         ):
-                            from src.main import IngestionPipeline
+                            with patch(
+                                "src.scraper.github_client.GitHubClient.get_commits",
+                                return_value=[{"sha": "abc123"}],
+                            ):
+                                from src.main import IngestionPipeline
 
-                            pipeline = IngestionPipeline(dry_run=True)
+                                pipeline = IngestionPipeline(dry_run=True)
 
-                            # This should NOT raise any exceptions
-                            results = pipeline.run_batch(max_kernels=1)
+                                # This should NOT raise any exceptions
+                                results = pipeline.run_batch(max_kernels=1)
 
-                            # In dry-run, no MiniMax annotation happens, but records pass filters
-                            # Note: "annotated" counts records that passed filters, not actual API calls
-                            assert results["annotated"] == 1
-                            assert results["filtered"] == 0
+                                # In dry-run, no MiniMax annotation happens, but records pass filters
+                                # Note: "annotated" counts records that passed filters, not actual API calls
+                                assert results["annotated"] == 1
+                                assert results["filtered"] == 0
 
 
 if __name__ == "__main__":

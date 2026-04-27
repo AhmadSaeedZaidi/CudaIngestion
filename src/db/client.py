@@ -39,9 +39,10 @@ class DatabaseClient:
     Uses batch inserts for high-throughput operations.
     """
 
-    BATCH_SIZE = 100
+    DEFAULT_INSERT_BATCH = 10
 
-    def __init__(self, connection_uri: str):
+    def __init__(self, connection_uri: str, insert_batch_size: int | None = None):
+        self.insert_batch_size = insert_batch_size if insert_batch_size is not None else self.DEFAULT_INSERT_BATCH
         self.engine: Engine = create_engine(
             connection_uri,
             poolclass=NullPool,
@@ -186,8 +187,8 @@ class DatabaseClient:
                 "edge_case_vulnerabilities": record.edge_case_vulnerabilities,
             })
         with self.engine.connect() as conn:
-            for i in range(0, len(values_list), self.BATCH_SIZE):
-                batch = values_list[i:i + self.BATCH_SIZE]
+            for i in range(0, len(values_list), self.insert_batch_size):
+                batch = values_list[i:i + self.insert_batch_size]
                 stmt = text("""
                     INSERT INTO kernels
                     (repo_name, file_path, commit_hash, raw_code, code_hash,

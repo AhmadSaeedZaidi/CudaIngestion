@@ -32,6 +32,8 @@ jobs:
           TOKEN_GITHUB: ${{ secrets.TOKEN_GITHUB }}
           MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
           BATCH_SIZE: 10
+          # Set to true once to reset Neon-backed repo pagination (page + query variant).
+          # RESET_GITHUB_REPO_DISCOVERY: true
         run: poetry run cuda-ingest --max-kernels 50
 
       - name: Upload logs

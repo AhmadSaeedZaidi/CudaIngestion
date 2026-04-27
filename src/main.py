@@ -17,6 +17,17 @@ from src.scraper.query_builder import QueryBuilder
 setup_logger("cuda-ingest")
 logger = get_logger(__name__)
 
+# Persisted 1-based page for /search/repositories (50 repos per page, max ~1000 results).
+GITHUB_REPO_SEARCH_PAGE_KEY = "github_repo_search_page"
+# Index into QueryBuilder.repo_discovery_queries() after exhausting paginated window.
+GITHUB_REPO_QUERY_INDEX_KEY = "github_repo_query_index"
+
+
+def _repo_search_max_pages(repos_per_page: int) -> int:
+    """GitHub repository search returns at most ~1000 items."""
+    rpp = max(1, repos_per_page)
+    return max(1, min(100, (1000 + rpp - 1) // rpp))
+
 
 class IngestionPipeline:
     """
@@ -45,8 +56,12 @@ class IngestionPipeline:
         self.annotator = MiniMaxAnnotator(
             api_key=self.config.minimax_api_key,
             api_base=self.config.minimax_api_base,
+            batch_size=self.config.batch_size,
         )
-        self.db_client = DatabaseClient(self.config.neon_uri)
+        self.db_client = DatabaseClient(
+            self.config.neon_uri,
+            insert_batch_size=self.config.batch_size,
+        )
 
         logger.info(f"Pipeline initialized (dry_run={self.dry_run})")
 
@@ -114,7 +129,7 @@ class IngestionPipeline:
 
     def process_kernel(self, repo: str, file_path: str, raw_code: str) -> KernelRecord | None:
         """
-        Process a single kernel: filter and annotate.
+        Process a single kernel: filter only (annotation is batched later).
 
         Args:
             repo: Repository name
@@ -122,7 +137,7 @@ class IngestionPipeline:
             raw_code: Raw CUDA code
 
         Returns:
-            KernelRecord with annotation or None if filtered out
+            KernelRecord without annotation (annotation is added in batch later)
         """
         # Apply heuristic filters
         passed, reason = self.cuda_filter.filter(raw_code)
@@ -140,30 +155,20 @@ class IngestionPipeline:
         except Exception:
             pass  # Keep "unknown" if commit fetch fails
 
-        # Annotate with MiniMax M2.7 (skip in dry run)
-        annotation = None
-        if not self.dry_run:
-            print("  -> Calling MiniMax API for annotation...", flush=True)
-            annotation = self.annotator.annotate(raw_code)
-            if annotation:
-                print(f"  -> Annotated: domain={annotation.domain_tag}", flush=True)
-        else:
-            logger.debug("Dry run: skipping MiniMax annotation for %s/%s", repo, file_path)
-
-        # Create kernel record with all annotation fields
+        # Create kernel record WITHOUT annotation (annotation is batched in run_batch)
         record = KernelRecord(
             repo_name=repo,
             file_path=file_path,
             commit_hash=commit_hash,
             raw_code=raw_code,
-            domain_tag=annotation.domain_tag if annotation else None,
-            algorithmic_intent=annotation.algorithmic_intent if annotation else None,
-            memory_pattern=annotation.memory_pattern if annotation else None,
-            hardware_utilization=annotation.hardware_utilization if annotation else None,
-            mathematical_formulation=annotation.mathematical_formulation if annotation else None,
-            thread_to_data_mapping=annotation.thread_to_data_mapping if annotation else None,
-            bottleneck_analysis=annotation.bottleneck_analysis if annotation else None,
-            edge_case_vulnerabilities=annotation.edge_case_vulnerabilities if annotation else None,
+            domain_tag=None,
+            algorithmic_intent=None,
+            memory_pattern=None,
+            hardware_utilization=None,
+            mathematical_formulation=None,
+            thread_to_data_mapping=None,
+            bottleneck_analysis=None,
+            edge_case_vulnerabilities=None,
         )
 
         return record
@@ -225,68 +230,90 @@ class IngestionPipeline:
         if checkpoint:
             logger.info(f"Resuming from checkpoint: {checkpoint}")
 
-        # Clear completed searches to allow fresh runs to re-search queries
-        if not self.dry_run:
-            deleted = self.db_client.delete_completed_searches()
-            if deleted > 0:
-                logger.info(f"Cleared {deleted} completed search entries for fresh run")
-
-        # Get diverse queries from multiple domains
+        # Diverse /search/code queries (valid qualifiers only); combined with repo: in the client.
         domain_queries = self.query_builder.get_diverse_batch(num_queries=5)
         logger.info(f"Using {len(domain_queries)} diverse domain queries: {domain_queries}")
 
-        # Collect unique search results across multiple domain queries
-        seen_signatures = set()
-        search_results = []
+        repos_per_run = self.config.repos_per_run
+        repo_page = 1
+        repo_queries = self.query_builder.repo_discovery_queries()
+        query_index = 0
+        if not self.dry_run:
+            if self.config.reset_github_repo_discovery:
+                self.db_client.set_state(GITHUB_REPO_SEARCH_PAGE_KEY, "1")
+                self.db_client.set_state(GITHUB_REPO_QUERY_INDEX_KEY, "0")
+                logger.info("RESET_GITHUB_REPO_DISCOVERY: repo page and query index reset")
+            raw_page = self.db_client.get_state(GITHUB_REPO_SEARCH_PAGE_KEY)
+            if raw_page and raw_page.strip().isdigit():
+                repo_page = max(1, int(raw_page.strip()))
+            raw_qi = self.db_client.get_state(GITHUB_REPO_QUERY_INDEX_KEY)
+            if raw_qi and raw_qi.strip().isdigit():
+                query_index = max(0, int(raw_qi.strip())) % len(repo_queries)
 
-        for i, query in enumerate(domain_queries):
-            print(f"[{i+1}/{len(domain_queries)}] Searching: {query}", flush=True)
-            logger.info(f"Searching with query: {query}")
+        repo_query = repo_queries[query_index]
+        print(
+            f"Fetching up to {repos_per_run} CUDA repositories "
+            f"(variant {query_index + 1}/{len(repo_queries)}, page {repo_page})...",
+            flush=True,
+        )
+        logger.info(f"Repo discovery query: {repo_query}")
+        search_results: list[dict[str, Any]] = []
+        repo_items: list[dict[str, Any]] = []
+        next_repo_page: int | None = None
+        next_query_index: int | None = None
 
-            # Use direct search for each query with DB-backed pagination
-            try:
-                # Extract domain name from query (e.g., "deep learning extension:cu" -> "deep_learning")
-                domain = query.split()[0].lower().replace(" ", "_")
+        try:
+            repo_response = self.github_client.search_repositories(
+                repo_query,
+                per_page=repos_per_run,
+                page=repo_page,
+                sort="stars",
+                order="desc",
+            )
+            repo_items = list(repo_response.get("items") or [])
+        except Exception as e:
+            logger.error(f"Repository search failed: {e}")
+            print(f"  -> Repository search failed: {type(e).__name__}: {e}", flush=True)
+            repo_items = []
 
-                # Pass db_client for pagination tracking and resume capability
-                results, checkpoint = self.github_client.search_cuda_files_with_checkpoint(
-                    query=query,
-                    max_results=30,  # Get up to 30 per query for diversity
-                    db_client=self.db_client if not self.dry_run else None,
-                    domain=domain,
-                )
-
-                status = checkpoint.get("status", "unknown")
-                page = checkpoint.get("page", 1)
-                processed = checkpoint.get("processed_count", 0)
-
-                if status == "completed":
-                    print(f"  -> Found {len(results)} results (query completed at page {page})", flush=True)
-                elif status == "rate_limited":
-                    print("  -> Rate limited, will retry later", flush=True)
-                    continue
+        if not repo_items:
+            print("  -> No repositories returned; check token or query.", flush=True)
+        else:
+            print(f"  -> {len(repo_items)} repositories; searching for .cu hits per repo...", flush=True)
+            search_results = self.github_client.collect_cuda_hits_from_repos(
+                repo_items,
+                domain_queries,
+                code_hits_per_repo=30,
+                max_total_candidates=max(max_kernels * 6, 200),
+            )
+            if not self.dry_run:
+                wrapped = False
+                max_pages = _repo_search_max_pages(repos_per_run)
+                if len(repo_items) >= repos_per_run:
+                    nxt = repo_page + 1
+                    if nxt > max_pages:
+                        nxt = 1
+                        wrapped = True
+                        logger.info(
+                            f"Repo search page exceeded window ({max_pages}); wrapping to page 1"
+                        )
                 else:
-                    print(f"  -> Found {len(results)} results (page {page}, processed: {processed})", flush=True)
+                    nxt = 1
+                next_repo_page = nxt
+                if wrapped:
+                    next_query_index = (query_index + 1) % len(repo_queries)
+                    logger.info(
+                        f"Rotating repo discovery variant -> {(next_query_index or 0) + 1}/{len(repo_queries)}"
+                    )
+                else:
+                    next_query_index = query_index
 
-            except Exception as e:
-                print(f"  -> Search failed: {type(e).__name__}: {e}", flush=True)
-                continue
+        print(f"Total ranked code hits (deduped): {len(search_results)}", flush=True)
+        logger.info(f"Collected {len(search_results)} code search hits from {len(repo_items)} repos")
 
-            for item in results:
-                sig = (item.get('repository', {}).get('full_name', ''), item.get('path', ''))
-                if sig not in seen_signatures:
-                    seen_signatures.add(sig)
-                    search_results.append(item)
-
-            # Delay between queries to avoid rate limits
-            if i < len(domain_queries) - 1:
-                time.sleep(0.5)
-
-        print(f"Total unique search results: {len(search_results)}", flush=True)
-        logger.info(f"Found {len(search_results)} unique search results across {len(domain_queries)} domains")
-
-        # Collect records to insert
-        records_to_insert: list[KernelRecord] = []
+        # Collect raw codes and records for batch annotation
+        raw_codes_to_annotate: list[str] = []
+        records_for_batch: list[tuple[KernelRecord, int]] = []  # (record, original_index)
 
         for item in search_results:
             if stats["fetched"] >= max_kernels:
@@ -307,17 +334,48 @@ class IngestionPipeline:
             repo, file_path, raw_code = kernel_data
             print(f"  -> Fetched {len(raw_code)} chars", flush=True)
 
-            # Process kernel (filter + annotate)
+            # Process kernel (filter only, no annotation yet)
             record = self.process_kernel(repo, file_path, raw_code)
             if not record:
                 stats["filtered"] += 1
                 continue
 
-            stats["annotated"] += 1
-            records_to_insert.append(record)
+            # Collect for batch annotation
+            raw_codes_to_annotate.append(raw_code)
+            records_for_batch.append((record, len(raw_codes_to_annotate) - 1))
 
-            # Respectful delay between API calls
+            # Respectful delay between GitHub API calls
             time.sleep(1)
+
+        # Batch annotate all collected kernels in one API call (if any)
+        if raw_codes_to_annotate:
+            if self.dry_run:
+                logger.info(f"Dry run: would batch annotate {len(raw_codes_to_annotate)} kernels")
+                stats["annotated"] = len(raw_codes_to_annotate)
+            else:
+                print(f"  -> Batch annotating {len(raw_codes_to_annotate)} kernels with MiniMax...", flush=True)
+                batch_annotations = self.annotator.annotate_batch(raw_codes_to_annotate)
+
+                # Assign annotations to records
+                for record, idx in records_for_batch:
+                    annotation = batch_annotations[idx]
+                    if annotation:
+                        record.domain_tag = annotation.domain_tag
+                        record.algorithmic_intent = annotation.algorithmic_intent
+                        record.memory_pattern = annotation.memory_pattern
+                        record.hardware_utilization = annotation.hardware_utilization
+                        record.mathematical_formulation = annotation.mathematical_formulation
+                        record.thread_to_data_mapping = annotation.thread_to_data_mapping
+                        record.bottleneck_analysis = annotation.bottleneck_analysis
+                        record.edge_case_vulnerabilities = annotation.edge_case_vulnerabilities
+                        print(f"  -> Annotated [{idx+1}/{len(raw_codes_to_annotate)}]: domain={annotation.domain_tag}", flush=True)
+                    else:
+                        print(f"  -> Annotation [{idx+1}/{len(raw_codes_to_annotate)}] failed", flush=True)
+
+                stats["annotated"] = len(raw_codes_to_annotate)
+
+        # Collect records to insert
+        records_to_insert = [rec for rec, _ in records_for_batch]
 
         # Batch insert into database (skip in dry run)
         if records_to_insert:
@@ -332,6 +390,14 @@ class IngestionPipeline:
         # Clear checkpoint on successful completion
         if stats["inserted"] > 0 or stats["annotated"] > 0:
             self._clear_checkpoint()
+
+        if next_repo_page is not None and not self.dry_run:
+            self.db_client.set_state(GITHUB_REPO_SEARCH_PAGE_KEY, str(next_repo_page))
+            if next_query_index is not None:
+                self.db_client.set_state(GITHUB_REPO_QUERY_INDEX_KEY, str(next_query_index))
+            logger.info(
+                f"Saved repo discovery cursor page={next_repo_page} query_index={next_query_index}"
+            )
 
         logger.info(f"Batch complete: {stats}")
         return stats

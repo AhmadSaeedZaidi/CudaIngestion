@@ -62,12 +62,18 @@ Return ONLY the JSON object, no additional text."""
     BATCH_SIZE = 10
     BATCH_DELAY = 2.0
 
-    def __init__(self, api_key: str, api_base: str = "https://api.minimax.io/v1"):
+    def __init__(
+        self,
+        api_key: str,
+        api_base: str = "https://api.minimax.io/v1",
+        batch_size: int | None = None,
+    ):
         """
         Initialize MiniMax annotator.
         """
         self.api_key = api_key
         self.api_base = api_base.rstrip("/")
+        self.batch_size = batch_size if batch_size is not None else self.BATCH_SIZE
         self.session = requests.Session()
         self.session.headers.update({
             "Authorization": f"Bearer {api_key}",
@@ -198,11 +204,12 @@ Return ONLY the JSON array, no additional text."""
             return []
 
         results = []
-        total_batches = (len(codes) + self.BATCH_SIZE - 1) // self.BATCH_SIZE
+        bs = self.batch_size
+        total_batches = (len(codes) + bs - 1) // bs
 
         for batch_idx in range(total_batches):
-            start = batch_idx * self.BATCH_SIZE
-            end = min(start + self.BATCH_SIZE, len(codes))
+            start = batch_idx * bs
+            end = min(start + bs, len(codes))
             batch_codes = codes[start:end]
 
             logger.info(f"Annotating batch {batch_idx + 1}/{total_batches} ({len(batch_codes)} kernels)")
