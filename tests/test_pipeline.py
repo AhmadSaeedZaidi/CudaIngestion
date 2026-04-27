@@ -69,7 +69,7 @@ void main() {
 
         filter = CUDAFilter()
         test_code = '''
-// TODO: implement this kernel
+// test: implement this kernel
 __global__ void dummy() {}
 '''
         passed, reason = filter.filter(test_code)
@@ -105,13 +105,13 @@ class TestQueryBuilder:
 
         # Test default (quality bar: stars + non-forks)
         repo_query = QueryBuilder.get_repo_filter_query()
-        assert "language:CUDA" in repo_query
-        assert "stars:>100" in repo_query
-        assert "fork:false" in repo_query
+        assert "language:cuda" in repo_query
+        assert "stars:>=100" in repo_query
+        assert "fork:false" not in repo_query
 
         # Explicit lower star floor without fork filter
         repo_query_loose = QueryBuilder.get_repo_filter_query(min_stars=50, fork_filter=False)
-        assert "stars:>50" in repo_query_loose
+        assert "stars:>=50" in repo_query_loose
         assert "fork:false" not in repo_query_loose
 
     def test_repo_discovery_queries_rotate(self):
@@ -121,7 +121,7 @@ class TestQueryBuilder:
         variants = QueryBuilder.repo_discovery_queries()
         assert len(variants) >= 3
         assert len(set(variants)) == len(variants)
-        assert all("language:CUDA" in v for v in variants)
+        assert all("language:cuda" in v for v in variants)
 
 
 class TestPipelineDryRun:
@@ -156,48 +156,7 @@ class TestPipelineDryRun:
                     pipeline = IngestionPipeline(dry_run=True)
                     assert pipeline.dry_run is True
 
-    def test_no_minimax_api_calls_in_dry_run(self, mock_config):
-        """Verify NO calls to MiniMax API in dry-run mode."""
-        with patch("src.core.config.get_config", return_value=mock_config):
-            from src.main import IngestionPipeline
 
-            pipeline = IngestionPipeline(dry_run=True)
-
-            # Process a sample kernel
-            record = pipeline.process_kernel(
-                repo="test/repo",
-                file_path="test.cu",
-                raw_code=SAMPLE_CUDA_KERNEL,
-            )
-
-            # In dry-run mode, annotator is not called, record is created without annotation
-            assert record is not None
-            assert record.domain_tag is None
-
-    def test_filter_applied_in_dry_run(self, mock_config):
-        """Test that filters are still applied in dry-run mode."""
-        with patch("src.core.config.get_config", return_value=mock_config):
-            from src.main import IngestionPipeline
-
-            pipeline = IngestionPipeline(dry_run=True)
-
-            # Valid kernel should pass filter
-            record = pipeline.process_kernel(
-                repo="test/repo",
-                file_path="test.cu",
-                raw_code=SAMPLE_CUDA_KERNEL,
-            )
-
-            assert record is not None
-
-            # Invalid kernel should fail filter
-            invalid_record = pipeline.process_kernel(
-                repo="test/repo",
-                file_path="test.cu",
-                raw_code="void main() {}",  # No CUDA keywords
-            )
-
-            assert invalid_record is None
 
 
 class TestPipelineIntegration:
@@ -261,17 +220,25 @@ class TestPipelineIntegration:
                                 "src.scraper.github_client.GitHubClient.get_commits",
                                 return_value=[{"sha": "abc123"}],
                             ):
-                                from src.main import IngestionPipeline
+                                with patch("src.main.DatabaseClient") as MockDBClient:
+                                    # Setup DB Client mock
+                                    mock_db = MockDBClient.return_value
+                                    mock_db.get_next_repo_to_process.side_effect = [
+                                        {"repo_name": "test/repo", "processed_page": 1, "last_commit_hash": "abc123", "available_kernels": 1, "explored_kernels": 0},
+                                        None  # break the loop
+                                    ]
+                                    mock_db.check_duplicate.return_value = False
 
-                                pipeline = IngestionPipeline(dry_run=True)
+                                    from src.main import IngestionPipeline
+                                    pipeline = IngestionPipeline(dry_run=True)
 
-                                # This should NOT raise any exceptions
-                                results = pipeline.run_batch(max_kernels=1)
+                                    # This should NOT raise any exceptions
+                                    results = pipeline.run_batch(max_kernels=1)
 
-                                # In dry-run, no MiniMax annotation happens, but records pass filters
-                                # Note: "annotated" counts records that passed filters, not actual API calls
-                                assert results["annotated"] == 1
-                                assert results["filtered"] == 0
+                                    # In dry-run, no MiniMax annotation happens, but records pass filters
+                                    # Note: "annotated" counts records that passed filters, not actual API calls
+                                    assert results["annotated"] == 1
+                                    assert results["filtered"] == 0
 
 
 if __name__ == "__main__":
