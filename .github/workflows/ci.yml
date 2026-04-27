@@ -28,7 +28,7 @@ jobs:
         run: poetry install
 
       - name: Run Ruff linter
-        run: poetry run ruff check src/
+        run: make lint
 
       - name: Run tests with pytest
         env:
@@ -36,7 +36,7 @@ jobs:
           TOKEN_GITHUB: ${{ secrets.TOKEN_GITHUB }}
           MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
           DRY_RUN: true  # Run tests in dry-run mode
-        run: poetry run pytest tests/ -v
+        run: make test
 
       - name: Upload test logs
         if: always()
