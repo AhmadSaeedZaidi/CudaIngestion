@@ -1,7 +1,6 @@
 """CUDA Kernel Ingestion Pipeline - Main Entry Point."""
 
 import base64
-import json
 import time
 from typing import Any
 
@@ -14,19 +13,8 @@ from src.scraper.github_client import GitHubClient
 from src.scraper.query_builder import QueryBuilder
 
 # Setup logging
-setup_logger("cuda-ingest")
+setup_logger("")
 logger = get_logger(__name__)
-
-# Persisted 1-based page for /search/repositories (50 repos per page, max ~1000 results).
-GITHUB_REPO_SEARCH_PAGE_KEY = "github_repo_search_page"
-# Index into QueryBuilder.repo_discovery_queries() after exhausting paginated window.
-GITHUB_REPO_QUERY_INDEX_KEY = "github_repo_query_index"
-
-
-def _repo_search_max_pages(repos_per_page: int) -> int:
-    """GitHub repository search returns at most ~1000 items."""
-    rpp = max(1, repos_per_page)
-    return max(1, min(100, (1000 + rpp - 1) // rpp))
 
 
 class IngestionPipeline:
@@ -35,16 +23,8 @@ class IngestionPipeline:
     Orchestrates scraping, filtering, annotation, and storage.
     """
 
-    # Checkpoint keys
-    CHECKPOINT_KEY = "github_search_checkpoint"
-
     def __init__(self, dry_run: bool = False):
-        """
-        Initialize the pipeline with configuration.
-
-        Args:
-            dry_run: If True, skip external API calls (MiniMax, database writes)
-        """
+        """Initialize the pipeline with configuration."""
         self.config = get_config()
         self.dry_run = dry_run or self.config.dry_run
         self.github_client = GitHubClient(self.config.github_token)
@@ -74,149 +54,72 @@ class IngestionPipeline:
         logger.info("Database schema ready")
 
     def decode_file_content(self, file_data: dict[str, Any]) -> str | None:
-        """
-        Decode base64-encoded file content from GitHub API.
-
-        Args:
-            file_data: File metadata from GitHub API
-
-        Returns:
-            Decoded file content or None on failure
-        """
+        """Decode base64-encoded file content from GitHub API."""
         try:
             if "content" not in file_data:
                 return None
-
             content = file_data["content"]
-            # GitHub returns base64 encoded content with line breaks
             encoded = content.replace("\n", "")
-            decoded = base64.b64decode(encoded).decode("utf-8")
-            return decoded
-
+            return base64.b64decode(encoded).decode("utf-8")
         except Exception as e:
             logger.error(f"Failed to decode file content: {e}")
             return None
 
     def fetch_kernel(self, search_item: dict[str, Any]) -> tuple[str, str, str] | None:
-        """
-        Fetch kernel code and metadata from GitHub.
-
-        Args:
-            search_item: Search result item from GitHub API
-
-        Returns:
-            Tuple of (repo_name, file_path, raw_code) or None on failure
-        """
+        """Fetch kernel code and metadata from GitHub."""
         try:
             repo = search_item.get("repository", {}).get("full_name", "")
             file_path = search_item.get("path", "")
-
             if not repo or not file_path:
                 return None
-
-            # Fetch file content
             file_data = self.github_client.get_file_content(repo, file_path)
             raw_code = self.decode_file_content(file_data)
-
             if not raw_code:
                 return None
-
             return repo, file_path, raw_code
-
         except Exception as e:
             logger.warning(f"Failed to fetch kernel {search_item.get('path')}: {e}")
             return None
 
-    def process_kernel(self, repo: str, file_path: str, raw_code: str) -> KernelRecord | None:
+    def discover_repos(self) -> None:
+        """Phase 1: Discover new repositories across different domains."""
+        queries = self.query_builder.repo_discovery_queries()
+        logger.info(f"Discovering repos using {len(queries)} base queries...")
+        for query in queries:
+            try:
+                response = self.github_client.search_repositories(
+                    query, per_page=30, page=1, sort="stars", order="desc"
+                )
+                items = response.get("items", [])
+                for item in items:
+                    repo_name = item.get("full_name")
+                    stars = item.get("stargazers_count", 0)
+                    
+                    # Determine basic domain tag from repo description/topics or query
+                    domain_tag = "general"
+                    topics = item.get("topics", [])
+                    desc = (item.get("description") or "").lower()
+                    if "machine-learning" in topics or "deep-learning" in topics or "ml" in desc:
+                        domain_tag = "machine_learning"
+                    elif "simulation" in topics or "physics" in desc:
+                        domain_tag = "simulation"
+                    elif "hpc" in topics or "hpc" in desc:
+                        domain_tag = "hpc"
+
+                    if repo_name:
+                        self.db_client.upsert_discovered_repo(repo_name, domain_tag, stars)
+            except Exception as e:
+                logger.error(f"Error discovering repos for query '{query}': {e}")
+            
+            # Respect rate limits
+            time.sleep(self.github_client._min_request_delay)
+
+    def run_batch(self, max_kernels: int = 50) -> dict[str, int]:
         """
-        Process a single kernel: filter only (annotation is batched later).
-
-        Args:
-            repo: Repository name
-            file_path: Path to the file
-            raw_code: Raw CUDA code
-
-        Returns:
-            KernelRecord without annotation (annotation is added in batch later)
+        Run the ingestion pipeline in two phases.
+        Loop until exactly max_kernels unique kernels are annotated and inserted.
         """
-        # Apply heuristic filters
-        passed, reason = self.cuda_filter.filter(raw_code)
-        if not passed:
-            logger.debug(f"Filtered out {repo}/{file_path}: {reason}")
-            return None
-
-        # Get commit hash for this file (with delay to avoid rate limits)
-        commit_hash = "unknown"
-        try:
-            # Add small delay before commit API call to spread requests
-            time.sleep(0.5)
-            commits = self.github_client.get_commits(repo, per_page=1)
-            commit_hash = commits[0].get("sha", "unknown") if commits else "unknown"
-        except Exception:
-            pass  # Keep "unknown" if commit fetch fails
-
-        # Create kernel record WITHOUT annotation (annotation is batched in run_batch)
-        record = KernelRecord(
-            repo_name=repo,
-            file_path=file_path,
-            commit_hash=commit_hash,
-            raw_code=raw_code,
-            domain_tag=None,
-            algorithmic_intent=None,
-            memory_pattern=None,
-            hardware_utilization=None,
-            mathematical_formulation=None,
-            thread_to_data_mapping=None,
-            bottleneck_analysis=None,
-            edge_case_vulnerabilities=None,
-        )
-
-        return record
-
-    def _get_checkpoint(self) -> dict[str, Any] | None:
-        """Load checkpoint from database."""
-        if self.dry_run:
-            return None
-        try:
-            checkpoint_json = self.db_client.get_state(self.CHECKPOINT_KEY)
-            if checkpoint_json:
-                return json.loads(checkpoint_json)
-        except Exception as e:
-            logger.warning(f"Failed to load checkpoint: {e}")
-        return None
-
-    def _save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
-        """Save checkpoint to database."""
-        if self.dry_run:
-            logger.debug(f"Dry run: would save checkpoint: {checkpoint}")
-            return
-        try:
-            self.db_client.set_state(self.CHECKPOINT_KEY, json.dumps(checkpoint))
-        except Exception as e:
-            logger.warning(f"Failed to save checkpoint: {e}")
-
-    def _clear_checkpoint(self) -> None:
-        """Clear checkpoint after successful completion."""
-        if self.dry_run:
-            return
-        try:
-            self.db_client.delete_state(self.CHECKPOINT_KEY)
-        except Exception as e:
-            logger.warning(f"Failed to clear checkpoint: {e}")
-
-    def run_batch(self, max_kernels: int = 10) -> dict[str, int]:
-        """
-        Run a batch of the ingestion pipeline.
-        Uses multi-query approach to get diverse kernels across different computational domains.
-
-        Args:
-            max_kernels: Maximum number of kernels to process
-
-        Returns:
-            Statistics dictionary
-        """
-        logger.info(f"Starting batch ingestion (max: {max_kernels}, dry_run={self.dry_run})")
-
+        logger.info(f"Starting batch ingestion (target: {max_kernels}, dry_run={self.dry_run})")
         stats = {
             "fetched": 0,
             "duplicates": 0,
@@ -225,193 +128,160 @@ class IngestionPipeline:
             "inserted": 0,
         }
 
-        # Load checkpoint if exists
-        checkpoint = self._get_checkpoint()
-        if checkpoint:
-            logger.info(f"Resuming from checkpoint: {checkpoint}")
+        total_inserted = 0
+        batch_size = self.config.batch_size
 
-        # Diverse /search/code queries (valid qualifiers only); combined with repo: in the client.
-        domain_queries = self.query_builder.get_diverse_batch(num_queries=5)
-        logger.info(f"Using {len(domain_queries)} diverse domain queries: {domain_queries}")
+        while total_inserted < max_kernels:
+            # PHASE 1: Repo Discovery (if no pending repos)
+            repo_info = self.db_client.get_next_repo_to_process()
+            if not repo_info and not self.dry_run:
+                logger.info("No pending repos found. Running discovery phase...")
+                self.discover_repos()
+                repo_info = self.db_client.get_next_repo_to_process()
 
-        repos_per_run = self.config.repos_per_run
-        repo_page = 1
-        repo_queries = self.query_builder.repo_discovery_queries()
-        query_index = 0
-        if not self.dry_run:
-            if self.config.reset_github_repo_discovery:
-                self.db_client.set_state(GITHUB_REPO_SEARCH_PAGE_KEY, "1")
-                self.db_client.set_state(GITHUB_REPO_QUERY_INDEX_KEY, "0")
-                logger.info("RESET_GITHUB_REPO_DISCOVERY: repo page and query index reset")
-            raw_page = self.db_client.get_state(GITHUB_REPO_SEARCH_PAGE_KEY)
-            if raw_page and raw_page.strip().isdigit():
-                repo_page = max(1, int(raw_page.strip()))
-            raw_qi = self.db_client.get_state(GITHUB_REPO_QUERY_INDEX_KEY)
-            if raw_qi and raw_qi.strip().isdigit():
-                query_index = max(0, int(raw_qi.strip())) % len(repo_queries)
-
-        repo_query = repo_queries[query_index]
-        print(
-            f"Fetching up to {repos_per_run} CUDA repositories "
-            f"(variant {query_index + 1}/{len(repo_queries)}, page {repo_page})...",
-            flush=True,
-        )
-        logger.info(f"Repo discovery query: {repo_query}")
-        search_results: list[dict[str, Any]] = []
-        repo_items: list[dict[str, Any]] = []
-        next_repo_page: int | None = None
-        next_query_index: int | None = None
-
-        try:
-            repo_response = self.github_client.search_repositories(
-                repo_query,
-                per_page=repos_per_run,
-                page=repo_page,
-                sort="stars",
-                order="desc",
-            )
-            repo_items = list(repo_response.get("items") or [])
-        except Exception as e:
-            logger.error(f"Repository search failed: {e}")
-            print(f"  -> Repository search failed: {type(e).__name__}: {e}", flush=True)
-            repo_items = []
-
-        if not repo_items:
-            print("  -> No repositories returned; check token or query.", flush=True)
-        else:
-            print(f"  -> {len(repo_items)} repositories; searching for .cu hits per repo...", flush=True)
-            search_results = self.github_client.collect_cuda_hits_from_repos(
-                repo_items,
-                domain_queries,
-                code_hits_per_repo=30,
-                max_total_candidates=max(max_kernels * 6, 200),
-            )
-            if not self.dry_run:
-                wrapped = False
-                max_pages = _repo_search_max_pages(repos_per_run)
-                if len(repo_items) >= repos_per_run:
-                    nxt = repo_page + 1
-                    if nxt > max_pages:
-                        nxt = 1
-                        wrapped = True
-                        logger.info(
-                            f"Repo search page exceeded window ({max_pages}); wrapping to page 1"
-                        )
-                else:
-                    nxt = 1
-                next_repo_page = nxt
-                if wrapped:
-                    next_query_index = (query_index + 1) % len(repo_queries)
-                    logger.info(
-                        f"Rotating repo discovery variant -> {(next_query_index or 0) + 1}/{len(repo_queries)}"
-                    )
-                else:
-                    next_query_index = query_index
-
-        print(f"Total ranked code hits (deduped): {len(search_results)}", flush=True)
-        logger.info(f"Collected {len(search_results)} code search hits from {len(repo_items)} repos")
-
-        # Collect raw codes and records for batch annotation
-        raw_codes_to_annotate: list[str] = []
-        records_for_batch: list[tuple[KernelRecord, int]] = []  # (record, original_index)
-
-        for item in search_results:
-            if stats["fetched"] >= max_kernels:
+            if not repo_info:
+                logger.warning("No repos available to process even after discovery.")
                 break
 
-            repo = item.get('repository', {}).get('full_name', '')
-            path = item.get('path', '')
-            print(f"[{stats['fetched']+1}/{max_kernels}] Fetching: {repo}/{path}", flush=True)
+            repo_name = repo_info["repo_name"]
+            processed_page = repo_info["processed_page"]
+            last_commit_hash = repo_info.get("last_commit_hash")
+            available_kernels = repo_info.get("available_kernels", 0)
+            explored_kernels = repo_info.get("explored_kernels", 0)
 
-            stats["fetched"] += 1
+            logger.info(f"Processing repo: {repo_name} (page {processed_page}, explored {explored_kernels}/{available_kernels})")
 
-            # Fetch kernel content
-            kernel_data = self.fetch_kernel(item)
-            if not kernel_data:
-                print("  -> FAILED to fetch", flush=True)
-                continue
+            # Fetch latest commit if we don't have it
+            if not last_commit_hash and not self.dry_run:
+                try:
+                    commits = self.github_client.get_commits(repo_name, per_page=1)
+                    last_commit_hash = commits[0].get("sha", "unknown") if commits else "unknown"
+                    self.db_client.update_repo_progress(repo_name, processed_page, last_commit_hash)
+                except Exception as e:
+                    logger.warning(f"Failed to get commit hash for {repo_name}: {e}")
+                    last_commit_hash = "unknown"
 
-            repo, file_path, raw_code = kernel_data
-            print(f"  -> Fetched {len(raw_code)} chars", flush=True)
+            # PHASE 2: Fetch Kernels
+            query = f"extension:cu repo:{repo_name}"
+            raw_codes_to_annotate = []
+            records_for_batch = []
+            
+            # Fetch kernels until we have enough for a batch OR run out of results
+            # We want to fill the batch, but if the target (max_kernels - total_inserted) is less than batch_size,
+            # we should cap it there.
+            target_for_this_batch = min(batch_size, max_kernels - total_inserted)
 
-            # Process kernel (filter only, no annotation yet)
-            record = self.process_kernel(repo, file_path, raw_code)
-            if not record:
-                stats["filtered"] += 1
-                continue
+            while len(raw_codes_to_annotate) < target_for_this_batch:
+                try:
+                    results = self.github_client.search_code(query, per_page=100, page=processed_page)
+                    items = results.get("items", [])
+                    
+                    if available_kernels == 0 and "total_count" in results:
+                        available_kernels = results["total_count"]
 
-            # Collect for batch annotation
-            raw_codes_to_annotate.append(raw_code)
-            records_for_batch.append((record, len(raw_codes_to_annotate) - 1))
+                    if not items or (available_kernels > 0 and explored_kernels >= available_kernels):
+                        if not self.dry_run:
+                            self.db_client.mark_repo_completed(repo_name)
+                        logger.info(f"Finished processing repo {repo_name} (explored {explored_kernels}/{available_kernels})")
+                        break
 
-            # Respectful delay between GitHub API calls
-            time.sleep(1)
+                    explored_this_page = 0
+                    for item in items:
+                        if len(raw_codes_to_annotate) >= target_for_this_batch:
+                            break
+                            
+                        explored_this_page += 1
 
-        # Batch annotate all collected kernels in one API call (if any)
-        if raw_codes_to_annotate:
-            if self.dry_run:
-                logger.info(f"Dry run: would batch annotate {len(raw_codes_to_annotate)} kernels")
-                stats["annotated"] = len(raw_codes_to_annotate)
-            else:
-                print(f"  -> Batch annotating {len(raw_codes_to_annotate)} kernels with MiniMax...", flush=True)
-                batch_annotations = self.annotator.annotate_batch(raw_codes_to_annotate)
+                        file_path = item.get("path", "")
+                        if not file_path:
+                            continue
 
-                # Assign annotations to records
-                for record, idx in records_for_batch:
-                    annotation = batch_annotations[idx]
-                    if annotation:
-                        record.domain_tag = annotation.domain_tag
-                        record.algorithmic_intent = annotation.algorithmic_intent
-                        record.memory_pattern = annotation.memory_pattern
-                        record.hardware_utilization = annotation.hardware_utilization
-                        record.mathematical_formulation = annotation.mathematical_formulation
-                        record.thread_to_data_mapping = annotation.thread_to_data_mapping
-                        record.bottleneck_analysis = annotation.bottleneck_analysis
-                        record.edge_case_vulnerabilities = annotation.edge_case_vulnerabilities
-                        print(f"  -> Annotated [{idx+1}/{len(raw_codes_to_annotate)}]: domain={annotation.domain_tag}", flush=True)
-                    else:
-                        print(f"  -> Annotation [{idx+1}/{len(raw_codes_to_annotate)}] failed", flush=True)
+                        # Fetch raw code
+                        kernel_data = self.fetch_kernel(item)
+                        if not kernel_data:
+                            continue
 
-                stats["annotated"] = len(raw_codes_to_annotate)
+                        _, _, raw_code = kernel_data
 
-        # Collect records to insert
-        records_to_insert = [rec for rec, _ in records_for_batch]
+                        # Pre-filter logic
+                        passed, reason = self.cuda_filter.filter(raw_code)
+                        if not passed:
+                            stats["filtered"] += 1
+                            continue
 
-        # Batch insert into database (skip in dry run)
-        if records_to_insert:
-            if self.dry_run:
-                logger.info(f"Dry run: would insert {len(records_to_insert)} records")
-                stats["inserted"] = len(records_to_insert)
-            else:
-                inserted = self.db_client.insert_batch(records_to_insert)
-                stats["inserted"] = inserted
-                stats["duplicates"] = len(records_to_insert) - inserted
+                        # Duplicate check BEFORE annotation
+                        if not self.dry_run:
+                            code_hash = self.db_client.compute_code_hash(raw_code)
+                            if self.db_client.check_duplicate(code_hash):
+                                stats["duplicates"] += 1
+                                continue
 
-        # Clear checkpoint on successful completion
-        if stats["inserted"] > 0 or stats["annotated"] > 0:
-            self._clear_checkpoint()
+                        stats["fetched"] += 1
 
-        if next_repo_page is not None and not self.dry_run:
-            self.db_client.set_state(GITHUB_REPO_SEARCH_PAGE_KEY, str(next_repo_page))
-            if next_query_index is not None:
-                self.db_client.set_state(GITHUB_REPO_QUERY_INDEX_KEY, str(next_query_index))
-            logger.info(
-                f"Saved repo discovery cursor page={next_repo_page} query_index={next_query_index}"
-            )
+                        record = KernelRecord(
+                            repo_name=repo_name,
+                            file_path=file_path,
+                            commit_hash=last_commit_hash or "unknown",
+                            raw_code=raw_code,
+                        )
+                        raw_codes_to_annotate.append(raw_code)
+                        records_for_batch.append(record)
+
+                    processed_page += 1
+                    explored_kernels += explored_this_page
+                    if not self.dry_run:
+                        self.db_client.update_repo_progress(
+                            repo_name, 
+                            processed_page, 
+                            last_commit_hash, 
+                            available_kernels=available_kernels, 
+                            explored_kernels_delta=explored_this_page
+                        )
+
+                    time.sleep(self.github_client._min_request_delay)
+
+                except Exception as e:
+                    logger.error(f"Error fetching kernels from {repo_name} page {processed_page}: {e}")
+                    # If it's a rate limit or other error, mark as completed or try next repo
+                    break
+
+            # Batch Annotate and Insert
+            if raw_codes_to_annotate:
+                if self.dry_run:
+                    stats["annotated"] += len(raw_codes_to_annotate)
+                    stats["inserted"] += len(raw_codes_to_annotate)
+                    total_inserted += len(raw_codes_to_annotate)
+                else:
+                    logger.info(f"Annotating batch of {len(raw_codes_to_annotate)} kernels...")
+                    annotations = self.annotator.annotate_batch(raw_codes_to_annotate)
+
+                    valid_records = []
+                    for record, annotation in zip(records_for_batch, annotations, strict=True):
+                        if annotation:
+                            record.domain_tag = annotation.domain_tag
+                            record.algorithmic_intent = annotation.algorithmic_intent
+                            record.memory_pattern = annotation.memory_pattern
+                            record.hardware_utilization = annotation.hardware_utilization
+                            record.mathematical_formulation = annotation.mathematical_formulation
+                            record.thread_to_data_mapping = annotation.thread_to_data_mapping
+                            record.bottleneck_analysis = annotation.bottleneck_analysis
+                            record.edge_case_vulnerabilities = annotation.edge_case_vulnerabilities
+                            valid_records.append(record)
+                            stats["annotated"] += 1
+                        else:
+                            logger.warning(f"Annotation failed for {record.repo_name}/{record.file_path}")
+
+                    if valid_records:
+                        inserted = self.db_client.insert_batch(valid_records)
+                        stats["inserted"] += inserted
+                        total_inserted += inserted
+                        logger.info(f"Inserted {inserted} kernels (Total this run: {total_inserted}/{max_kernels})")
 
         logger.info(f"Batch complete: {stats}")
         return stats
 
-    def run(self, max_kernels: int = 10) -> dict[str, Any]:
-        """
-        Run the full ingestion pipeline.
-
-        Args:
-            max_kernels: Maximum number of kernels to process
-
-        Returns:
-            Final statistics
-        """
+    def run(self, max_kernels: int = 50) -> dict[str, Any]:
+        """Run the full ingestion pipeline."""
         try:
             self.initialize()
             batch_stats = self.run_batch(max_kernels=max_kernels)
@@ -435,11 +305,6 @@ class IngestionPipeline:
             if not self.dry_run:
                 self.cleanup()
 
-    def cleanup(self) -> None:
-        """Clean up resources."""
-        self.db_client.close()
-        logger.info("Pipeline cleanup complete")
-
 
 def main() -> None:
     """Main entry point."""
@@ -449,8 +314,8 @@ def main() -> None:
     parser.add_argument(
         "--max-kernels",
         type=int,
-        default=10,
-        help="Maximum number of kernels to process (default: 10)",
+        default=50,
+        help="Maximum number of kernels to process (default: 50)",
     )
     parser.add_argument(
         "--dry-run",

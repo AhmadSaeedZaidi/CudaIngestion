@@ -105,6 +105,24 @@ class DatabaseClient:
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_search_progress_status ON search_progress(status)"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_search_progress_domain ON search_progress(domain)"))
 
+            # Discovered Repos table for two-phase ingestion
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS discovered_repos (
+                    id SERIAL PRIMARY KEY,
+                    repo_name VARCHAR(255) UNIQUE NOT NULL,
+                    domain_tag VARCHAR(100),
+                    stargazers_count INTEGER DEFAULT 0,
+                    last_commit_hash VARCHAR(40),
+                    processed_page INTEGER DEFAULT 1,
+                    available_kernels INTEGER DEFAULT 0,
+                    explored_kernels INTEGER DEFAULT 0,
+                    status VARCHAR(20) DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_discovered_repos_status ON discovered_repos(status)"))
+
             conn.commit()
         logger.info("Database schema initialized")
 
@@ -439,6 +457,111 @@ class DatabaseClient:
             conn.commit()
             logger.info(f"Deleted {deleted} completed search entries for fresh run")
             return deleted
+
+    # ---- Two-Phase Repo Discovery Methods ----
+
+    def upsert_discovered_repo(
+        self,
+        repo_name: str,
+        domain_tag: str | None = None,
+        stargazers_count: int = 0,
+    ) -> None:
+        """Upsert a discovered repository."""
+        with self.engine.connect() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO discovered_repos
+                    (repo_name, domain_tag, stargazers_count, created_at, updated_at)
+                    VALUES
+                    (:repo_name, :domain_tag, :stargazers_count, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    ON CONFLICT (repo_name)
+                    DO NOTHING
+                """),
+                {
+                    "repo_name": repo_name,
+                    "domain_tag": domain_tag,
+                    "stargazers_count": stargazers_count,
+                }
+            )
+            conn.commit()
+
+    def get_next_repo_to_process(self) -> dict[str, Any] | None:
+        """Get the next pending or processing repository, prioritized by stars."""
+        with self.engine.connect() as conn:
+            result = conn.execute(
+                text("""
+                    SELECT repo_name, domain_tag, stargazers_count, last_commit_hash, processed_page, status, available_kernels, explored_kernels
+                    FROM discovered_repos
+                    WHERE status IN ('pending', 'processing')
+                    ORDER BY stargazers_count DESC
+                    LIMIT 1
+                """)
+            )
+            row = result.fetchone()
+            if row:
+                # Mark it as processing if it was pending
+                if row[5] == 'pending':
+                    conn.execute(
+                        text("UPDATE discovered_repos SET status = 'processing', updated_at = CURRENT_TIMESTAMP WHERE repo_name = :repo_name"),
+                        {"repo_name": row[0]}
+                    )
+                    conn.commit()
+                return {
+                    "repo_name": row[0],
+                    "domain_tag": row[1],
+                    "stargazers_count": row[2],
+                    "last_commit_hash": row[3],
+                    "processed_page": row[4],
+                    "status": 'processing',
+                    "available_kernels": row[6],
+                    "explored_kernels": row[7],
+                }
+            return None
+
+    def update_repo_progress(
+        self,
+        repo_name: str,
+        processed_page: int,
+        last_commit_hash: str | None = None,
+        available_kernels: int | None = None,
+        explored_kernels_delta: int = 0,
+    ) -> None:
+        """Update processing progress for a repository."""
+        with self.engine.connect() as conn:
+            params = {"repo_name": repo_name, "processed_page": processed_page, "explored_delta": explored_kernels_delta}
+            update_hash_sql = ""
+            if last_commit_hash:
+                update_hash_sql = ", last_commit_hash = :last_commit_hash"
+                params["last_commit_hash"] = last_commit_hash
+                
+            update_avail_sql = ""
+            if available_kernels is not None:
+                update_avail_sql = ", available_kernels = :available_kernels"
+                params["available_kernels"] = available_kernels
+                
+            conn.execute(
+                text(f"""
+                    UPDATE discovered_repos
+                    SET processed_page = :processed_page, 
+                        explored_kernels = explored_kernels + :explored_delta,
+                        updated_at = CURRENT_TIMESTAMP 
+                        {update_hash_sql}
+                        {update_avail_sql}
+                    WHERE repo_name = :repo_name
+                """),
+                params
+            )
+            conn.commit()
+
+    def mark_repo_completed(self, repo_name: str) -> None:
+        """Mark a repository as completed."""
+        with self.engine.connect() as conn:
+            conn.execute(
+                text("UPDATE discovered_repos SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE repo_name = :repo_name"),
+                {"repo_name": repo_name}
+            )
+            conn.commit()
+            logger.info(f"Marked repository {repo_name} as completed.")
 
     def close(self) -> None:
         self.engine.dispose()

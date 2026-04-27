@@ -43,10 +43,10 @@ class GitHubClient:
         self._last_remaining = 9999  # Last known remaining requests
 
         # In-memory cache for file contents to avoid redundant API calls
-        self._file_cache: dict[str, str] = {}
+        self._file_cache: dict[str, Any] = {}
 
         # In-memory cache for commit hashes
-        self._commit_cache: dict[str, str] = {}
+        self._commit_cache: dict[str, Any] = {}
 
         self._min_request_delay = self.MIN_REQUEST_DELAY
         env_delay = os.getenv("GITHUB_REQUEST_DELAY_SECONDS", "").strip()
@@ -122,6 +122,10 @@ class GitHubClient:
         """
         self._throttle()
 
+        # Add a default timeout of 30 seconds if not provided
+        if "timeout" not in kwargs:
+            kwargs["timeout"] = 30
+        
         response = self.session.request(method, url, **kwargs)
 
         # Update rate limit tracking
@@ -233,21 +237,33 @@ class GitHubClient:
 
     def get_file_content(self, repo: str, path: str, ref: str | None = None) -> dict[str, Any]:
         """Get the content of a file from a repository."""
+        cache_key = f"{repo}:{path}:{ref}"
+        if cache_key in self._file_cache:
+            return self._file_cache[cache_key]
+
         url = f"{self.BASE_URL}/repos/{repo}/contents/{path}"
         params = {"ref": ref} if ref else {}
 
         logger.debug(f"Fetching file: {repo}/{path}")
-        return self._request("GET", url, params=params)
+        result = self._request("GET", url, params=params)
+        self._file_cache[cache_key] = result
+        return result
 
     def get_commits(self, repo: str, per_page: int = 30, sha: str | None = None) -> list[dict[str, Any]]:
         """Get commits for a repository."""
+        cache_key = f"{repo}:{per_page}:{sha}"
+        if cache_key in self._commit_cache:
+            return self._commit_cache[cache_key]
+
         url = f"{self.BASE_URL}/repos/{repo}/commits"
         params = {"per_page": per_page}
         if sha:
             params["sha"] = sha
 
         logger.debug(f"Fetching commits: {repo}")
-        return self._request("GET", url, params=params)
+        result = self._request("GET", url, params=params)
+        self._commit_cache[cache_key] = result
+        return result
 
     @staticmethod
     def score_kernel(item: dict[str, Any]) -> float:
@@ -463,9 +479,6 @@ class GitHubClient:
                 if "repository" in item and isinstance(item["repository"], dict):
                     item["repository"]["stargazers_count"] = stars
                 collected.append(item)
-
-            delay = self._min_request_delay + random.uniform(0, self.REQUEST_DELAY_JITTER)
-            time.sleep(delay)
 
         collected = self._sort_by_quality(collected)
         return collected[:max_total_candidates]

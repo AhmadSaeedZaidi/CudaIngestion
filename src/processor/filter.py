@@ -36,16 +36,11 @@ class CUDAFilter:
         "cuda",  # CUDA library usage
     ]
 
-    # Patterns indicating dummy/test code
     DUMMY_PATTERNS = [
-        r"^\s*//\s*(test|benchmark|demo|sample)",
-        r"^\s*#include\s+\"fake",
+        r"(?m)^\s*//\s*(test|benchmark|demo|sample)\b",
+        r"(?m)^\s*#include\s+\"fake",
         r"void\s+main\s*\(\s*\)",  # Host main in what should be device code
-        r"cout\s*<<",  # C++ iostream in CUDA (often indicates test code)
         r"printf\s*\(\s*\"test",
-        r"//\s*TODO",
-        r"//\s*FIXME",
-        r"//\s*HACK",
     ]
 
     # Patterns indicating actual kernel implementations (relaxed)
@@ -63,7 +58,7 @@ class CUDAFilter:
     MIN_LINES = 10
 
     # Maximum ratio of comments to code (indicates commented-out code)
-    MAX_COMMENT_RATIO = 0.7
+    MAX_COMMENT_RATIO = 3.0
 
     def __init__(self, min_length: int = 50, max_length: int = 100000):
         """

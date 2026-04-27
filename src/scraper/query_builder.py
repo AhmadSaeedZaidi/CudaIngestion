@@ -139,11 +139,13 @@ class QueryBuilder:
             Repository search query string
         """
         query_parts = [
-            "language:CUDA",
-            f"stars:>{min_stars}",
+            "language:cuda",
+            f"stars:>={min_stars}",
         ]
-        if fork_filter:
-            query_parts.append("fork:false")
+        # We disabled fork:false because it frequently causes GitHub search API timeouts 
+        # (incomplete_results: true) when combined with other constraints.
+        # if fork_filter:
+        #     query_parts.append("fork:false")
 
         return " ".join(query_parts)
 
