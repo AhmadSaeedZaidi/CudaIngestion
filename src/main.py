@@ -330,7 +330,7 @@ class IngestionPipeline:
 
         finally:
             if not self.dry_run:
-                self.cleanup()
+                self.db_client.close()
 
 
 def main() -> None:
