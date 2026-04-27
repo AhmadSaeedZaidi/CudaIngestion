@@ -142,7 +142,7 @@ class QueryBuilder:
             "language:cuda",
             f"stars:>={min_stars}",
         ]
-        # We disabled fork:false because it frequently causes GitHub search API timeouts 
+        # We disabled fork:false because it frequently causes GitHub search API timeouts
         # (incomplete_results: true) when combined with other constraints.
         # if fork_filter:
         #     query_parts.append("fork:false")

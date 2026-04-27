@@ -125,7 +125,7 @@ class GitHubClient:
         # Add a default timeout of 30 seconds if not provided
         if "timeout" not in kwargs:
             kwargs["timeout"] = 30
-        
+
         response = self.session.request(method, url, **kwargs)
 
         # Update rate limit tracking

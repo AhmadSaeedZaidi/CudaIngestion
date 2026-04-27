@@ -94,7 +94,7 @@ class IngestionPipeline:
                 for item in items:
                     repo_name = item.get("full_name")
                     stars = item.get("stargazers_count", 0)
-                    
+
                     # Determine basic domain tag from repo description/topics or query
                     domain_tag = "general"
                     topics = item.get("topics", [])
@@ -110,7 +110,7 @@ class IngestionPipeline:
                         self.db_client.upsert_discovered_repo(repo_name, domain_tag, stars)
             except Exception as e:
                 logger.error(f"Error discovering repos for query '{query}': {e}")
-            
+
             # Respect rate limits
             time.sleep(self.github_client._min_request_delay)
 
@@ -165,7 +165,7 @@ class IngestionPipeline:
             query = f"extension:cu repo:{repo_name}"
             raw_codes_to_annotate = []
             records_for_batch = []
-            
+
             # Fetch kernels until we have enough for a batch OR run out of results
             # We want to fill the batch, but if the target (max_kernels - total_inserted) is less than batch_size,
             # we should cap it there.
@@ -175,7 +175,7 @@ class IngestionPipeline:
                 try:
                     results = self.github_client.search_code(query, per_page=100, page=processed_page)
                     items = results.get("items", [])
-                    
+
                     if available_kernels == 0 and "total_count" in results:
                         available_kernels = results["total_count"]
 
@@ -189,7 +189,7 @@ class IngestionPipeline:
                     for item in items:
                         if len(raw_codes_to_annotate) >= target_for_this_batch:
                             break
-                            
+
                         explored_this_page += 1
 
                         file_path = item.get("path", "")
@@ -231,10 +231,10 @@ class IngestionPipeline:
                     explored_kernels += explored_this_page
                     if not self.dry_run:
                         self.db_client.update_repo_progress(
-                            repo_name, 
-                            processed_page, 
-                            last_commit_hash, 
-                            available_kernels=available_kernels, 
+                            repo_name,
+                            processed_page,
+                            last_commit_hash,
+                            available_kernels=available_kernels,
                             explored_kernels_delta=explored_this_page
                         )
 

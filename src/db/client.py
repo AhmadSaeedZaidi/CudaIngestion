@@ -533,18 +533,18 @@ class DatabaseClient:
             if last_commit_hash:
                 update_hash_sql = ", last_commit_hash = :last_commit_hash"
                 params["last_commit_hash"] = last_commit_hash
-                
+
             update_avail_sql = ""
             if available_kernels is not None:
                 update_avail_sql = ", available_kernels = :available_kernels"
                 params["available_kernels"] = available_kernels
-                
+
             conn.execute(
                 text(f"""
                     UPDATE discovered_repos
-                    SET processed_page = :processed_page, 
+                    SET processed_page = :processed_page,
                         explored_kernels = explored_kernels + :explored_delta,
-                        updated_at = CURRENT_TIMESTAMP 
+                        updated_at = CURRENT_TIMESTAMP
                         {update_hash_sql}
                         {update_avail_sql}
                     WHERE repo_name = :repo_name
