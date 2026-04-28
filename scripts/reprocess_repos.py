@@ -54,12 +54,12 @@ def main():
     try:
         with db.engine.connect() as conn:
             from sqlalchemy import text
-            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_discovered_repos_filter_version ON discovered_repos(filter_version)"))
-
             try:
                 conn.execute(text("ALTER TABLE discovered_repos ADD COLUMN IF NOT EXISTS filter_version VARCHAR(10) DEFAULT 'v1'"))
             except Exception:
                 pass
+
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_discovered_repos_filter_version ON discovered_repos(filter_version)"))
 
             conn.commit()
     except Exception as e:
