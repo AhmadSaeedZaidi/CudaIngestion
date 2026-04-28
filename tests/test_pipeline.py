@@ -69,12 +69,28 @@ void main() {
 
         filter = CUDAFilter()
         test_code = '''
-// test: implement this kernel
-__global__ void dummy() {}
+// test
+__global__ void dummy_kernel_that_is_long_enough_to_pass_the_length_filter() {
+    int x = threadIdx.x;
+}
 '''
         passed, reason = filter.filter(test_code)
 
         assert not passed
+
+    def test_relaxed_dummy_patterns(self):
+        """Test that relaxed dummy patterns allow descriptive comments."""
+        from src.processor.filter import CUDAFilter
+
+        filter = CUDAFilter()
+        test_code = '''
+// test: this is a test implementation of a real kernel
+__global__ void matrix_mul_test_kernel_with_enough_length_to_pass(float* a) {
+    int tx = threadIdx.x;
+}
+'''
+        passed, reason = filter.filter(test_code)
+        assert passed
 
 
 class TestQueryBuilder:
@@ -145,16 +161,10 @@ class TestPipelineDryRun:
 
     def test_pipeline_initializes_in_dry_run(self, mock_config):
         """Test that pipeline initializes correctly in dry-run mode."""
-        # Patch get_config before importing IngestionPipeline
-        with patch.dict("sys.modules", {}):
-            with patch("src.core.config.Config") as MockConfig:
-                MockConfig.return_value = mock_config
-                from src.main import IngestionPipeline
-
-                # Create pipeline directly without calling get_config
-                with patch("src.core.config.get_config", return_value=mock_config):
-                    pipeline = IngestionPipeline(dry_run=True)
-                    assert pipeline.dry_run is True
+        with patch("src.core.config.get_config", return_value=mock_config):
+            from src.main import IngestionPipeline
+            pipeline = IngestionPipeline(dry_run=True)
+            assert pipeline.dry_run is True
 
 
 
@@ -199,6 +209,7 @@ class TestPipelineIntegration:
             ]
         }
 
+        import src.main
         with patch("src.core.config.get_config", return_value=mock_config):
             with patch(
                 "src.scraper.github_client.GitHubClient.search_repositories",
