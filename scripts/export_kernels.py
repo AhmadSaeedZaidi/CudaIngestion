@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 
 from src.core.config import get_config
-from src.core.logger import setup_logger, get_logger
+from src.core.logger import get_logger, setup_logger
 
 setup_logger("")
 logger = get_logger(__name__)
@@ -52,16 +52,16 @@ def main():
             table = pa.Table.from_pandas(chunk)
             if writer is None:
                 writer = pq.ParquetWriter(output_path, table.schema, compression='snappy')
-            
+
             writer.write_table(table)
             total_rows += len(chunk)
             logger.info(f"Written chunk {chunk_idx + 1} ({len(chunk)} rows)...")
-            
+
         if writer:
             writer.close()
-    
+
     engine.dispose()
-    
+
     logger.info(f"Successfully exported {total_rows} total rows to {output_path}")
 
 

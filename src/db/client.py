@@ -117,11 +117,18 @@ class DatabaseClient:
                     available_kernels INTEGER DEFAULT 0,
                     explored_kernels INTEGER DEFAULT 0,
                     status VARCHAR(20) DEFAULT 'pending',
+                    filter_version VARCHAR(10) DEFAULT 'v1',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """))
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_discovered_repos_status ON discovered_repos(status)"))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS idx_discovered_repos_filter_version ON discovered_repos(filter_version)"))
+
+            try:
+                conn.execute(text("ALTER TABLE discovered_repos ADD COLUMN IF NOT EXISTS filter_version VARCHAR(10) DEFAULT 'v1'"))
+            except Exception:
+                pass
 
             conn.commit()
         logger.info("Database schema initialized")
@@ -465,15 +472,16 @@ class DatabaseClient:
         repo_name: str,
         domain_tag: str | None = None,
         stargazers_count: int = 0,
+        filter_version: str = "v1",
     ) -> None:
         """Upsert a discovered repository."""
         with self.engine.connect() as conn:
             conn.execute(
                 text("""
                     INSERT INTO discovered_repos
-                    (repo_name, domain_tag, stargazers_count, created_at, updated_at)
+                    (repo_name, domain_tag, stargazers_count, filter_version, created_at, updated_at)
                     VALUES
-                    (:repo_name, :domain_tag, :stargazers_count, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    (:repo_name, :domain_tag, :stargazers_count, :filter_version, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                     ON CONFLICT (repo_name)
                     DO NOTHING
                 """),
@@ -481,6 +489,7 @@ class DatabaseClient:
                     "repo_name": repo_name,
                     "domain_tag": domain_tag,
                     "stargazers_count": stargazers_count,
+                    "filter_version": filter_version,
                 }
             )
             conn.commit()
@@ -562,6 +571,91 @@ class DatabaseClient:
             )
             conn.commit()
             logger.info(f"Marked repository {repo_name} as completed.")
+
+    def get_repos_for_reprocessing(self, min_stars: int = 50) -> list[dict[str, Any]]:
+        """
+        Get high-star repos that were processed with v1 filters and need reprocessing.
+
+        Args:
+            min_stars: Minimum star count to consider a repo for reprocessing
+
+        Returns:
+            List of dicts with repo info
+        """
+        with self.engine.connect() as conn:
+            result = conn.execute(
+                text("""
+                    SELECT repo_name, domain_tag, stargazers_count, processed_page, available_kernels, explored_kernels
+                    FROM discovered_repos
+                    WHERE status = 'completed'
+                      AND filter_version = 'v1'
+                      AND stargazers_count >= :min_stars
+                    ORDER BY stargazers_count DESC
+                """),
+                {"min_stars": min_stars}
+            )
+            rows = result.fetchall()
+            return [
+                {
+                    "repo_name": row[0],
+                    "domain_tag": row[1],
+                    "stargazers_count": row[2],
+                    "processed_page": row[3],
+                    "available_kernels": row[4],
+                    "explored_kernels": row[5],
+                }
+                for row in rows
+            ]
+
+    def reset_repos_for_v2_filter(self, repo_names: list[str] | None = None) -> int:
+        """
+        Reset completed repos with v1 filter to pending status for reprocessing with v2 filters.
+        Optionally filter to specific repo names.
+
+        Args:
+            repo_names: Optional list of specific repo names to reset (for targeted reprocessing)
+
+        Returns:
+            Number of repos reset
+        """
+        with self.engine.connect() as conn:
+            if repo_names:
+                placeholders = ", ".join([f":name{i}" for i in range(len(repo_names))])
+                params = {f"name{i}": name for i, name in enumerate(repo_names)}
+                result = conn.execute(
+                    text(f"""
+                        UPDATE discovered_repos
+                        SET status = 'pending',
+                            processed_page = 1,
+                            explored_kernels = 0,
+                            filter_version = 'v2',
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE status = 'completed'
+                          AND filter_version = 'v1'
+                          AND repo_name IN ({placeholders})
+                        RETURNING repo_name
+                    """),
+                    params
+                )
+            else:
+                result = conn.execute(
+                    text("""
+                        UPDATE discovered_repos
+                        SET status = 'pending',
+                            processed_page = 1,
+                            explored_kernels = 0,
+                            filter_version = 'v2',
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE status = 'completed'
+                          AND filter_version = 'v1'
+                          AND stargazers_count >= 50
+                        RETURNING repo_name
+                    """)
+                )
+            updated = len(result.fetchall())
+            conn.commit()
+            logger.info(f"Reset {updated} repos for v2 filter reprocessing")
+            return updated
 
     def close(self) -> None:
         self.engine.dispose()

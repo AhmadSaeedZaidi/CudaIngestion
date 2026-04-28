@@ -60,3 +60,22 @@ CREATE TABLE IF NOT EXISTS search_progress (
 
 CREATE INDEX IF NOT EXISTS idx_search_progress_status ON search_progress(status);
 CREATE INDEX IF NOT EXISTS idx_search_progress_domain ON search_progress(domain);
+
+-- Discovered Repos table for two-phase ingestion
+CREATE TABLE IF NOT EXISTS discovered_repos (
+    id SERIAL PRIMARY KEY,
+    repo_name VARCHAR(255) UNIQUE NOT NULL,
+    domain_tag VARCHAR(100),
+    stargazers_count INTEGER DEFAULT 0,
+    last_commit_hash VARCHAR(40),
+    processed_page INTEGER DEFAULT 1,
+    available_kernels INTEGER DEFAULT 0,
+    explored_kernels INTEGER DEFAULT 0,
+    status VARCHAR(20) DEFAULT 'pending',
+    filter_version VARCHAR(10) DEFAULT 'v1',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_discovered_repos_status ON discovered_repos(status);
+CREATE INDEX IF NOT EXISTS idx_discovered_repos_filter_version ON discovered_repos(filter_version);

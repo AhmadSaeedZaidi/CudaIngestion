@@ -153,13 +153,12 @@ class QueryBuilder:
     def repo_discovery_queries() -> list[str]:
         """
         Rotating /search/repositories queries after each full API window (~1000 repos).
-        Different star floors and pushed windows surface overlapping but not identical sets.
         """
         q = QueryBuilder.get_repo_filter_query
         return [
-            q(100, True),
-            q(50, True),
-            f"{q(100, True)} pushed:>2023-06-01",
-            q(150, True),
-            f"{q(80, True)} pushed:>2024-01-01",
+            q(10, True),
+            q(25, True),
+            q(20, True),
+            q(15, True),
+            q(5, True),
         ]

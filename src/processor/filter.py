@@ -34,13 +34,17 @@ class CUDAFilter:
         "gridDim",
         "kernel",  # Generic kernel indicator
         "cuda",  # CUDA library usage
+        "warpSize",  # Warp-related constant
+        "__syncthreads",  # Synchronization
+        "cudaFree",
+        "cudaStream",  # Streams
+        "cudaEvent",  # Events
     ]
 
     DUMMY_PATTERNS = [
-        r"(?m)^\s*//\s*(test|benchmark|demo|sample)\b",
-        r"(?m)^\s*#include\s+\"fake",
-        r"void\s+main\s*\(\s*\)",  # Host main in what should be device code
-        r"printf\s*\(\s*\"test",
+        r"(?m)^\s*//\s*(test|benchmark|demo|sample)\s*$",  # Only match full-line comments
+        r"(?m)^\s*#include\s+\"fake",  # Fake includes (no $ - allow variations)
+        r"printf\s*\(\s*\"test\s*\"",  # Must have literal "test"
     ]
 
     # Patterns indicating actual kernel implementations (relaxed)
@@ -52,12 +56,11 @@ class CUDAFilter:
         r"<<<",  # Kernel launch syntax
         r"threadIdx",  # Thread indexing
         r"blockIdx",  # Block indexing
+        r"warpSize",  # Warp constant
+        r"__syncthreads",  # Synchronization
     ]
 
-    # Minimum line count for a real kernel
     MIN_LINES = 10
-
-    # Maximum ratio of comments to code (indicates commented-out code)
     MAX_COMMENT_RATIO = 3.0
 
     def __init__(self, min_length: int = 50, max_length: int = 100000):
@@ -101,10 +104,8 @@ class CUDAFilter:
         Returns:
             FilterResult indicating pass/fail
         """
-        # Count how many device keywords are present
         keyword_count = sum(1 for kw in self.DEVICE_KEYWORDS if kw in code)
 
-        # Require at least 1 device-related keyword (relaxed from 2)
         if keyword_count < 1:
             return FilterResult(False, f"Insufficient device keywords: found {keyword_count}")
 
@@ -176,22 +177,18 @@ class CUDAFilter:
         Returns:
             Tuple of (passed, reason)
         """
-        # Length check first (fast)
         result = self.check_length(code)
         if not result.passed:
             return False, result.reason
 
-        # Check for device keywords
         result = self.check_device_keywords(code)
         if not result.passed:
             return False, result.reason
 
-        # Check for kernel patterns
         result = self.check_kernel_patterns(code)
         if not result.passed:
             return False, result.reason
 
-        # Check for dummy patterns
         result = self.check_dummy_patterns(code)
         if not result.passed:
             return False, result.reason
